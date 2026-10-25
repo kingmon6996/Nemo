@@ -1,0 +1,109 @@
+add_library(nemo
+    core/version.cpp
+    core/status.cpp
+    core/error.cpp
+    core/config.cpp
+    logging/logger.cpp
+    storage/checksum.cpp
+    storage/page_header.cpp
+    storage/database_header.cpp
+    storage/page.cpp
+    storage/buffer_frame.cpp
+    storage/clock_replacer.cpp
+    storage/buffer_pool.cpp
+    storage/page_handle.cpp
+    storage/free_page_manager.cpp
+    storage/file_manager.cpp
+    storage/disk_manager.cpp
+    types/type_info.cpp
+    types/type_registry.cpp
+    types/decimal.cpp
+    types/uuid.cpp
+    types/temporal.cpp
+    types/json.cpp
+    types/array.cpp
+    types/dict.cpp
+    types/value.cpp
+    types/value_view.cpp
+    types/type_serializer.cpp
+    types/type_comparator.cpp
+    types/type_hasher.cpp
+    types/type_cast.cpp
+    storage/record_id.cpp
+    storage/tuple_layout.cpp
+    storage/record_header.cpp
+    storage/record.cpp
+    storage/record_view.cpp
+    storage/record_serializer.cpp
+    storage/record_deserializer.cpp
+    storage/slot.cpp
+    storage/slot_directory.cpp
+    storage/table_page.cpp
+    storage/table_heap.cpp
+    index/index_key.cpp
+    index/index_entry.cpp
+    index/index_comparator.cpp
+    index/bplus_tree_page.cpp
+    index/bplus_tree_node.cpp
+    index/bplus_tree_leaf.cpp
+    index/bplus_tree_internal.cpp
+    index/index_metadata.cpp
+    index/bplus_tree.cpp
+    index/bplus_tree_iterator.cpp
+    index/index_stats.cpp
+    catalog/default_value.cpp
+    catalog/column.cpp
+    catalog/constraint.cpp
+    catalog/table_schema.cpp
+    catalog/catalog.cpp
+    catalog/catalog_serializer.cpp
+    sql/source_location.cpp
+    sql/sql_error.cpp
+    sql/token_type.cpp
+    sql/token.cpp
+    sql/lexer.cpp
+    sql/ast/expression.cpp
+    sql/ast/expressions.cpp
+    sql/ast/literals.cpp
+    sql/ast/statement.cpp
+    sql/ast/select.cpp
+    sql/ast/ast_formatter.cpp
+    sql/parser.cpp
+    concurrency/wait_for_graph.cpp
+    concurrency/lock_manager.cpp
+    transaction/snapshot.cpp
+    transaction/transaction.cpp
+    transaction/transaction_registry.cpp
+    transaction/transaction_manager.cpp
+    transaction/visibility.cpp
+    wal/log_record.cpp
+    wal/wal_segment.cpp
+    wal/wal_manager.cpp
+    wal/log_reader.cpp
+    wal/checkpoint_manager.cpp
+    wal/recovery_manager.cpp
+    api/database.cpp
+    api/connection.cpp
+    api/transaction.cpp
+    api/result.cpp
+    api/row.cpp
+    api/prepared_statement.cpp
+    execution/binder/binder.cpp
+    execution/planner/planner.cpp
+    runtime/connection_manager.cpp
+    runtime/query_registry.cpp
+    runtime/connection_pool.cpp
+    runtime/worker.cpp
+    runtime/worker_pool.cpp
+)
+
+target_include_directories(nemo
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+        $<INSTALL_INTERFACE:include>
+)
+
+# Enforce strict warnings for the core library
+nemo_enable_strict_warnings(nemo)
+nemo_enable_sanitizers(nemo)
+set_target_properties(nemo PROPERTIES POSITION_INDEPENDENT_CODE ON)

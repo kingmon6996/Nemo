@@ -1,0 +1,4 @@
+add_executable(nemo_example basic.cpp)
+target_link_libraries(nemo_example PRIVATE nemo)
+nemo_enable_strict_warnings(nemo_example)
+nemo_enable_sanitizers(nemo_example)

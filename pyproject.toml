@@ -1,0 +1,43 @@
+[build-system]
+requires = ["scikit-build-core>=0.8.0", "pybind11>=2.11.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "nemo-py"
+version = "0.1.1"
+authors = [
+  { name="Pravanjan Roy" },
+]
+description = "High-performance embedded relational database written in C++20 with a unified Sync/Async Python API."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+keywords = ["database", "embedded", "sql", "relational", "asyncio", "sqlite-alternative", "nemo"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database :: Database Engines/Servers",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://nemo.kingmon.dev"
+Documentation = "https://nemo.kingmon.dev/docs"
+Repository = "https://github.com/kingmon6996/Nemo.git"
+"Bug Tracker" = "https://github.com/kingmon6996/Nemo/issues"
+
+[tool.scikit-build]
+wheel.packages = ["python/src/nemo"]
+cmake.define.NEMO_BUILD_PYTHON = "ON"
+cmake.define.NEMO_BUILD_TESTS = "OFF"
+cmake.define.NEMO_BUILD_EXAMPLES = "OFF"

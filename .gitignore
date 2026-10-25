@@ -1,0 +1,104 @@
+# =============================================================================
+# NEMO DATABASE ENGINE — GITIGNORE CONFIGURATION
+# =============================================================================
+
+# --- 1. Compiled Binaries, Libraries & Debug Symbols ---
+*.o
+*.obj
+*.slo
+*.lo
+*.so
+*.dylib
+*.dll
+*.pyd
+*.a
+*.lib
+*.exp
+*.lai
+*.la
+*.exe
+*.out
+*.app
+*.pdb
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+
+# --- 2. CMake, MSVC & Native Build Outputs ---
+build/
+build_*/
+_skbuild/
+wheelhouse/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+CMakeUserPresets.json
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+.cache/
+x64/
+x86/
+Debug/
+Release/
+
+# --- 3. Python Bytecode, Packaging & Distribution ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.whl
+dist/
+*.egg-info/
+package/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- 4. Virtual Environments & Local Config ---
+.env
+.env.*
+.Python
+env/
+venv/
+.venv/
+venv-*/
+
+# --- 5. Database Binary Files, WAL & Logs ---
+*.nm
+*.nm.meta
+*.nm-wal
+*.nm-shm
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# --- 6. Local Test Scripts, Benchmarks & Datasets ---
+tests/
+test.py
+test2.py
+dataset/
+ci_logs/
+scratch/
+
+# --- 7. IDE, Editor & OS System Files ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.vcxproj.user
+*.vcxproj.filters.user
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini

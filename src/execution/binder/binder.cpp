@@ -5,6 +5,9 @@
 #include "nemo/sql/ast/literals.hpp"
 #include "nemo/core/status.hpp"
 
+#include <algorithm>
+#include <cctype>
+
 namespace nemo::execution::binder {
 
 Status NameResolver::add_table(const std::string& table_name, const std::string& alias) {

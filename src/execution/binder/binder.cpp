@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cctype>
 
+#include <algorithm>
+#include <cctype>
+
 namespace nemo::execution::binder {
 
 Status NameResolver::add_table(const std::string& table_name, const std::string& alias) {

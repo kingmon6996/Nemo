@@ -130,6 +130,8 @@ public:
     mutable std::shared_mutex db_mutex;
     std::unordered_map<std::string, std::shared_ptr<TableData>> tables;
     std::unordered_map<std::string, std::shared_ptr<Sequence>> sequences;
+    std::unordered_map<std::string, std::string> views;
+    std::unordered_set<std::string> secondary_indexes;
 
     std::string get_meta_path() const {
         if (db_path.empty()) return "";
@@ -416,10 +418,16 @@ public:
 
 class ConnectionImpl {
 public:
+    struct SavepointSnapshot {
+        std::string name;
+        std::unordered_map<std::string, std::pair<std::size_t, std::vector<std::vector<types::Value>>>> table_states;
+    };
+
     std::shared_ptr<runtime::ConnectionLease> lease;
     std::shared_ptr<runtime::WorkerPool> worker_pool;
     std::shared_ptr<SharedDatabaseState> shared_state;
     bool in_transaction{false};
+    std::vector<SavepointSnapshot> savepoints;
 };
 
 class ResultImpl {

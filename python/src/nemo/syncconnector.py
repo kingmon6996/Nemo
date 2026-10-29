@@ -102,6 +102,24 @@ class SyncTransaction:
     def __enter__(self):
         return self.begin()
 
+    def savepoint(self, name: str):
+        if self._native_txn is not None and hasattr(self._native_txn, "savepoint"):
+            self._native_txn.savepoint(name)
+        else:
+            self._conn.execute(f"SAVEPOINT {name};")
+
+    def rollback_to(self, name: str):
+        if self._native_txn is not None and hasattr(self._native_txn, "rollback_to"):
+            self._native_txn.rollback_to(name)
+        else:
+            self._conn.execute(f"ROLLBACK TO SAVEPOINT {name};")
+
+    def release_savepoint(self, name: str):
+        if self._native_txn is not None and hasattr(self._native_txn, "release_savepoint"):
+            self._native_txn.release_savepoint(name)
+        else:
+            self._conn.execute(f"RELEASE SAVEPOINT {name};")
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
             self.commit()
@@ -197,6 +215,15 @@ class SyncConnection:
     def rollback(self):
         if hasattr(self._native, "rollback"):
             self._native.rollback()
+
+    def savepoint(self, name: str):
+        return self.execute(f"SAVEPOINT {name};")
+
+    def rollback_to(self, name: str):
+        return self.execute(f"ROLLBACK TO SAVEPOINT {name};")
+
+    def release_savepoint(self, name: str):
+        return self.execute(f"RELEASE SAVEPOINT {name};")
 
     def set_autocommit(self, enabled: bool):
         if hasattr(self._native, "set_autocommit"):

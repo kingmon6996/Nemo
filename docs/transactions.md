@@ -16,10 +16,16 @@ This guide covers all transaction types, methods, callbacks, and patterns availa
 | `Transaction` | `txn.begin()` | `() -> Transaction` | Starts the transaction (called automatically by context manager or `begin_transaction()`). |
 | `Transaction` | `txn.commit()` | `() -> None` | Commits this transaction instance. |
 | `Transaction` | `txn.rollback()` | `() -> None` | Rolls back this transaction instance. |
+| `Transaction` | `txn.savepoint(name)` | `(name: str) -> None` | Creates a named savepoint checkpoint. |
+| `Transaction` | `txn.rollback_to(name)` | `(name: str) -> None` | Rolls back the transaction to the specified savepoint. |
+| `Transaction` | `txn.release_savepoint(name)` | `(name: str) -> None` | Discards the savepoint mark and later savepoints. |
+| `Connection` | `conn.savepoint(name)` | `(name: str) -> None` | Shortcut to mark a savepoint on the active transaction. |
+| `Connection` | `conn.rollback_to(name)` | `(name: str) -> None` | Shortcut to rollback to a savepoint on the connection. |
+| `Connection` | `conn.release_savepoint(name)` | `(name: str) -> None` | Shortcut to release a savepoint on the connection. |
 
 ---
 
-## All 7 Transaction Patterns and Use Cases
+## All 8 Transaction Patterns and Use Cases
 
 ### Pattern 1: Automatic Context Manager Transactions
 
@@ -182,7 +188,29 @@ def execute_with_retry(conn, fn, max_attempts=5):
 
 ---
 
+### Pattern 8: Microsecond Savepoints & Nested Transaction Checkpoints
+
+Savepoints allow speculative execution within a transaction, rolling back erroneous intermediate actions without aborting the parent transaction:
+
+```python
+with conn.transaction() as txn:
+    conn.execute("INSERT INTO audit_log VALUES ('txn_start');")
+    
+    # Create checkpoint
+    txn.savepoint("checkpoint_1")
+    try:
+        conn.execute("UPDATE critical_table SET val = ? WHERE id = ?;", (val, row_id))
+        if validation_fails:
+            # Revert only the speculative update
+            txn.rollback_to("checkpoint_1")
+    finally:
+        txn.release_savepoint("checkpoint_1")
+```
+
+---
+
 ## Related Runnable Examples
+- [`example_56.py`](../example/example_56.py): Microsecond Savepoints & Nested Transactions (`SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`).
 
 - [`example_9.py`](../example/example_9.py): ACID Transactions, Rollbacks, and Multi-Version Concurrency (MVCC).
 - [`example_10.py`](../example/example_10.py): Multi-Threaded Connection Pooling and High Concurrency.

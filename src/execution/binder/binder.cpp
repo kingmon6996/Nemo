@@ -4,6 +4,8 @@
 #include "nemo/sql/ast/select.hpp"
 #include "nemo/sql/ast/literals.hpp"
 #include "nemo/core/status.hpp"
+#include <algorithm>
+#include <cctype>
 
 namespace nemo::execution::binder {
 

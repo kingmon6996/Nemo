@@ -7,7 +7,7 @@ std::string_view version() noexcept {
     // some template metaprogramming to convert ints to chars at compile time,
     // or just hardcode the string here and ensure they match.
     // Given the constraints, a static string literal is the cleanest approach.
-    return "0.1.1";
+    return "0.2.0";
 }
 
 } // namespace nemo

@@ -377,6 +377,18 @@ PYBIND11_MODULE(_nemo, m) {
         .def("rollback", [](Transaction& self) {
             auto res = self.rollback();
             if (!res) throw std::runtime_error("Rollback failed");
+        })
+        .def("savepoint", [](Transaction& self, const std::string& name) {
+            auto res = self.savepoint(name);
+            if (!res) throw std::runtime_error("Savepoint failed");
+        })
+        .def("rollback_to", [](Transaction& self, const std::string& name) {
+            auto res = self.rollback_to(name);
+            if (!res) throw std::runtime_error("Rollback to savepoint failed");
+        })
+        .def("release_savepoint", [](Transaction& self, const std::string& name) {
+            auto res = self.release_savepoint(name);
+            if (!res) throw std::runtime_error("Release savepoint failed");
         });
 
     py::class_<PreparedStatement>(m, "PreparedStatement")

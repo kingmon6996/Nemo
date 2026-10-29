@@ -106,6 +106,24 @@ class AsyncTransaction:
     async def __aenter__(self):
         return await self.begin()
 
+    async def savepoint(self, name: str):
+        if self._native_txn is not None and hasattr(self._native_txn, "savepoint"):
+            await self._conn._loop.run_in_executor(None, self._native_txn.savepoint, name)
+        else:
+            await self._conn.execute(f"SAVEPOINT {name};")
+
+    async def rollback_to(self, name: str):
+        if self._native_txn is not None and hasattr(self._native_txn, "rollback_to"):
+            await self._conn._loop.run_in_executor(None, self._native_txn.rollback_to, name)
+        else:
+            await self._conn.execute(f"ROLLBACK TO SAVEPOINT {name};")
+
+    async def release_savepoint(self, name: str):
+        if self._native_txn is not None and hasattr(self._native_txn, "release_savepoint"):
+            await self._conn._loop.run_in_executor(None, self._native_txn.release_savepoint, name)
+        else:
+            await self._conn.execute(f"RELEASE SAVEPOINT {name};")
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_type is None:
             await self.commit()
@@ -217,6 +235,15 @@ class AsyncConnection:
     async def rollback(self):
         if hasattr(self._native, "rollback"):
             await self._loop.run_in_executor(None, self._native.rollback)
+
+    async def savepoint(self, name: str):
+        return await self.execute(f"SAVEPOINT {name};")
+
+    async def rollback_to(self, name: str):
+        return await self.execute(f"ROLLBACK TO SAVEPOINT {name};")
+
+    async def release_savepoint(self, name: str):
+        return await self.execute(f"RELEASE SAVEPOINT {name};")
 
     async def set_autocommit(self, enabled: bool):
         if hasattr(self._native, "set_autocommit"):

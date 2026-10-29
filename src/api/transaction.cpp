@@ -41,16 +41,25 @@ nemo::Result<void> Transaction::rollback() {
     return m_conn->rollback();
 }
 
-nemo::Result<void> Transaction::savepoint(std::string_view /*name*/) {
-    return Status::Unsupported;
+nemo::Result<void> Transaction::savepoint(std::string_view name) {
+    if (!m_active || !m_conn) return Status::InvalidState;
+    auto res = m_conn->execute("SAVEPOINT " + std::string(name) + ";");
+    if (!res) return res.error();
+    return nemo::Result<void>::success();
 }
 
-nemo::Result<void> Transaction::rollback_to(std::string_view /*name*/) {
-    return Status::Unsupported;
+nemo::Result<void> Transaction::rollback_to(std::string_view name) {
+    if (!m_active || !m_conn) return Status::InvalidState;
+    auto res = m_conn->execute("ROLLBACK TO SAVEPOINT " + std::string(name) + ";");
+    if (!res) return res.error();
+    return nemo::Result<void>::success();
 }
 
-nemo::Result<void> Transaction::release_savepoint(std::string_view /*name*/) {
-    return Status::Unsupported;
+nemo::Result<void> Transaction::release_savepoint(std::string_view name) {
+    if (!m_active || !m_conn) return Status::InvalidState;
+    auto res = m_conn->execute("RELEASE SAVEPOINT " + std::string(name) + ";");
+    if (!res) return res.error();
+    return nemo::Result<void>::success();
 }
 
 } // namespace nemo::api

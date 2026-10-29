@@ -314,3 +314,56 @@ Readers never block writers, and writers never block readers. Under high multi-t
 - [`example_36.py`](../example/example_36.py): Batch ID Range Allocation.
 
 
+
+---
+
+## 7. Advanced SQL Engine Features (v0.2.0)
+
+For full details, architecture, and examples, refer to the [Advanced SQL Engine Features Guide](sql_features.md) and [Savepoints Guide](savepoints.md).
+
+### High-Speed Grouping & Pagination
+```sql
+SELECT dept, count(*), sum(salary), avg(salary) FROM employees GROUP BY dept HAVING count(*) > 5;
+SELECT * FROM sales OFFSET 100 ROWS FETCH FIRST 25 ROWS ONLY;
+SELECT DISTINCT category FROM products;
+```
+
+### Branchless Expressions & Predicates
+```sql
+SELECT id, CASE WHEN score >= 90 THEN 'A' WHEN score >= 75 THEN 'B' ELSE 'C' END FROM grades;
+SELECT * FROM users WHERE status IN ('active', 'verified') AND notes IS NOT NULL;
+SELECT * FROM catalog WHERE price BETWEEN 10.0 AND 50.0 AND title LIKE 'Pro%';
+```
+
+### Cache-Conscious Joins & Set Operations
+```sql
+SELECT e.name, d.name FROM employees e LEFT JOIN departments d ON e.dept_id = d.id;
+SELECT e.name, d.name FROM employees e FULL JOIN departments d USING (dept_id);
+SELECT item FROM warehouse_a UNION SELECT item FROM warehouse_b;
+SELECT item FROM warehouse_a INTERSECT SELECT item FROM warehouse_b;
+SELECT item FROM warehouse_a EXCEPT SELECT item FROM warehouse_b;
+```
+
+### Extended DML, Atomic UPSERT & RETURNING
+```sql
+INSERT INTO inventory VALUES (1, 'Pen', 10) ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty;
+INSERT INTO archive_items SELECT * FROM active_items;
+INSERT INTO accounts VALUES (10, 'Alice', 500.0) RETURNING id, balance;
+```
+
+### Zero-Copy Schema Evolution & Views
+```sql
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'member';
+ALTER TABLE users RENAME COLUMN role TO user_role;
+ALTER TABLE users DROP COLUMN IF EXISTS temp_col;
+ALTER TABLE users RENAME TO members;
+CREATE VIEW active_users AS SELECT id, name FROM members WHERE is_active = true;
+CREATE INDEX idx_members_name ON members (name);
+```
+
+### Microsecond Savepoints
+```sql
+SAVEPOINT step1;
+ROLLBACK TO SAVEPOINT step1;
+RELEASE SAVEPOINT step1;
+```

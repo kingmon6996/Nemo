@@ -88,6 +88,16 @@ This directory contains **50 comprehensive, self-contained executable examples**
 | **`example_49.py`** | B+ Tree indexing anatomy: point query index lookups vs contiguous sibling leaf pointer range scans (`BETWEEN`). | `python example/example_49.py` |
 | **`example_50.py`** | Comprehensive master architecture showcase uniting pooling, transactions, hash joins, SIMD, queues, and columnar extraction. | `python example/example_50.py` |
 
+### Category 9: Advanced SQL Engine Features (Phases 1 – 6)
+| Example | Topic / Feature Demonstrated | Run Command |
+| :--- | :--- | :--- |
+| **`example_51.py`** | High-speed multi-column `GROUP BY`, aggregate accumulators (`SUM`, `COUNT`, `MIN`, `MAX`, `AVG`), `HAVING` filters, `SELECT DISTINCT`, and SQL:2008 `OFFSET` / `FETCH FIRST` zero-copy pagination. | `python example/example_51.py` |
+| **`example_52.py`** | Branchless expressions & predicates: Searched/Simple `CASE WHEN`, SIMD & hash-accelerated `IN` / `NOT IN`, short-circuit `EXISTS`, `IS NULL`, `BETWEEN`, and `LIKE`. | `python example/example_52.py` |
+| **`example_53.py`** | Cache-conscious outer joins (`LEFT`, `RIGHT`, `FULL OUTER`, `CROSS JOIN`, `USING`) and streaming set operations (`UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`). | `python example/example_53.py` |
+| **`example_54.py`** | Extended DML, atomic UPSERT (`ON CONFLICT DO UPDATE SET` / `DO NOTHING`), direct-stream `INSERT ... SELECT`, and pipelined `RETURNING` clauses. | `python example/example_54.py` |
+| **`example_55.py`** | Zero-copy schema evolution (`ALTER TABLE ADD/DROP/RENAME COLUMN/TABLE`), lightweight virtual views (`CREATE/REPLACE/DROP VIEW`), and adaptive secondary indexing. | `python example/example_55.py` |
+| **`example_56.py`** | Microsecond savepoints, nested transaction checkpoints, and partial rollbacks (`SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`, `txn.savepoint()`). | `python example/example_56.py` |
+
 ---
 
 ## Running the Examples

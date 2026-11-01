@@ -1,30 +1,31 @@
 #ifndef NEMO_RUNTIME_MEMORY_RESOURCE_HPP
 #define NEMO_RUNTIME_MEMORY_RESOURCE_HPP
 
-#include <memory_resource>
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <new>
 
 namespace nemo::runtime {
 
 class MemoryLimitExceeded : public std::runtime_error {
 public:
-    MemoryLimitExceeded(const std::string& what_arg) : std::runtime_error(what_arg) {}
+    explicit MemoryLimitExceeded(const std::string& what_arg) : std::runtime_error(what_arg) {}
 };
 
-class QueryMemoryResource : public std::pmr::memory_resource {
+class QueryMemoryResource {
 public:
-    explicit QueryMemoryResource(std::size_t limit_bytes, std::pmr::memory_resource* upstream = std::pmr::get_default_resource())
-        : m_limit(limit_bytes), m_upstream(upstream) {}
+    explicit QueryMemoryResource(std::size_t limit_bytes)
+        : m_limit(limit_bytes) {}
 
     std::size_t usage() const noexcept { return m_usage.load(std::memory_order_relaxed); }
     std::size_t limit() const noexcept { return m_limit; }
     
     void reset_usage() noexcept { m_usage.store(0, std::memory_order_relaxed); }
 
-protected:
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+    void* allocate(std::size_t bytes, std::size_t /*alignment*/ = alignof(std::max_align_t)) {
         std::size_t current = m_usage.load(std::memory_order_relaxed);
         while (true) {
             if (current + bytes > m_limit) {
@@ -35,26 +36,23 @@ protected:
             }
         }
         
-        try {
-            return m_upstream->allocate(bytes, alignment);
-        } catch (...) {
+        void* ptr = std::malloc(bytes);
+        if (!ptr) {
             m_usage.fetch_sub(bytes, std::memory_order_relaxed);
-            throw;
+            throw std::bad_alloc();
         }
+        return ptr;
     }
 
-    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
-        m_upstream->deallocate(p, bytes, alignment);
-        m_usage.fetch_sub(bytes, std::memory_order_relaxed);
-    }
-
-    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
-        return this == &other;
+    void deallocate(void* p, std::size_t bytes, std::size_t /*alignment*/ = alignof(std::max_align_t)) noexcept {
+        if (p) {
+            std::free(p);
+            m_usage.fetch_sub(bytes, std::memory_order_relaxed);
+        }
     }
 
 private:
     std::size_t m_limit;
-    std::pmr::memory_resource* m_upstream;
     std::atomic<std::size_t> m_usage{0};
 };
 

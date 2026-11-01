@@ -28,7 +28,7 @@ from .errors import (
 )
 from .logging import LoggingConfig, configure_logging, enable_debug
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 __all__ = [
     "connect", "Database", 
     "SyncConnector", "SyncConnection", "SyncConnectionPool", "SyncConnectorPool",

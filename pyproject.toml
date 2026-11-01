@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "nemo-py"
-version = "0.2.1"
+version = "0.2.2"
 authors = [
   { name="Pravanjan Roy" },
 ]
@@ -41,3 +41,6 @@ wheel.packages = ["python/src/nemo"]
 cmake.define.NEMO_BUILD_PYTHON = "ON"
 cmake.define.NEMO_BUILD_TESTS = "OFF"
 cmake.define.NEMO_BUILD_EXAMPLES = "OFF"
+
+[tool.cibuildwheel]
+build-verbosity = 1

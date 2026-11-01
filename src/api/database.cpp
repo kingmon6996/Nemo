@@ -102,7 +102,7 @@ Result<void> Database::backup(std::string_view /*path*/) {
 }
 
 std::string Database::engine_version() {
-    return "0.2.1";
+    return "0.2.2";
 }
 
 int Database::format_version() const {

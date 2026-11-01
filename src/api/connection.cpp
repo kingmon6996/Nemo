@@ -114,22 +114,31 @@ std::vector<types::Value> parse_simple_values(std::string_view sql) {
         } else if (token == "null" || token == "NULL") {
             vals.emplace_back();
         } else if (token.find('.') != std::string_view::npos) {
-            double d = 0.0;
-            auto [p, ec] = std::from_chars(token.data(), token.data() + token.size(), d);
-            if (ec == std::errc()) {
-                vals.emplace_back(d);
-            } else {
-                std::string tmp_tok(token);
-                vals.emplace_back(std::strtod(tmp_tok.c_str(), nullptr));
-            }
+            std::string tmp_tok(token);
+            char* ep = nullptr;
+            vals.emplace_back(std::strtod(tmp_tok.c_str(), &ep));
         } else {
-            std::int64_t iv = 0;
-            auto [p, ec] = std::from_chars(token.data(), token.data() + token.size(), iv);
-            if (ec == std::errc()) {
-                vals.emplace_back(iv);
+            bool neg = false;
+            size_t idx = 0;
+            if (!token.empty() && token[0] == '-') { neg = true; idx = 1; }
+            else if (!token.empty() && token[0] == '+') { idx = 1; }
+            std::int64_t v = 0;
+            bool ok = (idx < token.size());
+            for (; idx < token.size(); ++idx) {
+                char ch = token[idx];
+                if (ch >= '0' && ch <= '9') {
+                    v = v * 10 + (ch - '0');
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                vals.emplace_back(neg ? -v : v);
             } else {
                 std::string tmp_tok(token);
-                vals.emplace_back(static_cast<std::int64_t>(std::strtoll(tmp_tok.c_str(), nullptr, 10)));
+                char* ep = nullptr;
+                vals.emplace_back(static_cast<std::int64_t>(std::strtoll(tmp_tok.c_str(), &ep, 10)));
             }
         }
     };

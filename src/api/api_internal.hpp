@@ -42,7 +42,7 @@ struct TableStatistics {
 };
 
 struct Sequence {
-    std::string name;
+    std::string name;                                     
     std::int64_t current_val{1};
     std::int64_t start_with{1};
     std::int64_t increment_by{1};
@@ -342,6 +342,7 @@ public:
                     }
                     tbl->sample_rows.push_back(std::move(row_vals));
                 }
+                tbl->total_rows = tbl->sample_rows.size();
                 tables[t_name] = tbl;
             }
             ifs.close();
@@ -428,6 +429,8 @@ public:
     std::shared_ptr<SharedDatabaseState> shared_state;
     bool in_transaction{false};
     std::vector<SavepointSnapshot> savepoints;
+    std::string cached_insert_table_name;
+    std::shared_ptr<TableData> cached_insert_table{nullptr};
 };
 
 class ResultImpl {
@@ -438,19 +441,58 @@ public:
     std::vector<ColumnMetadata> columns;
     QueryStatistics stats;
     std::vector<std::vector<types::Value>> rows;
+    std::shared_ptr<TableData> table_ref{nullptr};
+    std::size_t single_row_idx{static_cast<std::size_t>(-1)};
+    bool is_join{false};
+    std::shared_ptr<TableData> join_tbl1{nullptr};
+    std::shared_ptr<TableData> join_tbl2{nullptr};
+    struct JoinColRef {
+        bool from_tbl1{true};
+        std::size_t col_idx{0};
+    };
+    std::vector<JoinColRef> join_proj;
+    std::vector<std::pair<std::size_t, std::size_t>> join_pairs;
     std::size_t total_rows{0};
     std::size_t current_row{0};
+
+    const std::vector<std::vector<types::Value>>& get_effective_rows() const noexcept {
+        if (table_ref && single_row_idx == static_cast<std::size_t>(-1)) return table_ref->sample_rows;
+        return rows;
+    }
 
     std::unique_ptr<Row> create_next_row() {
         if (current_row >= total_rows) {
             return nullptr;
         }
         auto row_impl = std::make_unique<RowImpl>();
-        if (!rows.empty()) {
-            if (is_exact || rows.size() == total_rows) {
-                row_impl->values = rows[current_row];
+        if (single_row_idx != static_cast<std::size_t>(-1) && table_ref) {
+            if (single_row_idx < table_ref->sample_rows.size()) {
+                row_impl->values = table_ref->sample_rows[single_row_idx];
+            }
+            current_row++;
+            return std::unique_ptr<Row>(new Row(std::move(row_impl)));
+        }
+        if (is_join && join_tbl1 && join_tbl2 && current_row < join_pairs.size()) {
+            const auto& p = join_pairs[current_row++];
+            const auto& r1 = (p.first != static_cast<std::size_t>(-1) && p.first < join_tbl1->sample_rows.size()) ? join_tbl1->sample_rows[p.first] : std::vector<types::Value>{};
+            const auto& r2 = (p.second != static_cast<std::size_t>(-1) && p.second < join_tbl2->sample_rows.size()) ? join_tbl2->sample_rows[p.second] : std::vector<types::Value>{};
+            row_impl->values.reserve(join_proj.size());
+            for (const auto& jc : join_proj) {
+                const auto& src = jc.from_tbl1 ? r1 : r2;
+                if (jc.col_idx < src.size()) {
+                    row_impl->values.push_back(src[jc.col_idx]);
+                } else {
+                    row_impl->values.push_back(types::Value());
+                }
+            }
+            return std::unique_ptr<Row>(new Row(std::move(row_impl)));
+        }
+        const auto& eff_rows = get_effective_rows();
+        if (!eff_rows.empty()) {
+            if (is_exact || eff_rows.size() == total_rows) {
+                row_impl->values = eff_rows[current_row];
             } else {
-                row_impl->values = rows[current_row % rows.size()];
+                row_impl->values = eff_rows[current_row % eff_rows.size()];
                 if (!row_impl->values.empty()) {
                     row_impl->values[0] = types::Value(static_cast<std::int64_t>(current_row + 1));
                 }

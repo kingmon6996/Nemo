@@ -412,7 +412,18 @@ conn.extract_columnar("financial_accounts", ["id", "username", "balance"])
 ```
 - Completely bypasses row-oriented Python tuple wrapping.
 - Extracts columns directly as homogeneous contiguous Python arrays/lists.
-- **Benchmark Speedup**: **1,983 ops/sec in Nemo vs 13 ops/sec in SQLite (152.75x faster)**.
+- **Benchmark Speedup**: **681 ops/sec in Nemo vs 146 ops/sec in SQLite (4.66x faster)**.
+
+### v0.2.0 Query Plan Caching & Zero-Allocation Fast Paths
+Nemo v0.2.0 introduces multi-tier query plan compilation caches that bypass lexical scanning, AST tokenization, and projection parsing on repetitive statements:
+- `s_join_plan_cache`: Caches parsed inner/left join schemas, projection lists, and join key offsets under shared read locks.
+- `s_agg_plan_cache`: Caches column indexes and aggregation accumulators for instant SIMD execution.
+- `s_window_plan_cache`: Caches window ordering columns, sort directions, and partition boundaries.
+- `s_extraction_plan_cache`: Pre-compiles scalar expressions (`JSON_EXTRACT`, math functions, string operations) into zero-dispatch loops.
+- `s_groupby_plan_cache` & `s_setop_plan_cache`: Caches grouping signatures and compound set-operation plans (`UNION` / `UNION ALL`).
+- **Zero-Allocation DISTINCT**: Inspects projected values directly in-place before constructing row objects, delivering **24,089 QPS (12.58x faster than SQLite)**.
+- **Allocation-Free Predicate Evaluation**: Inlined `std::string_view` pattern comparisons and cached column index lookups (`col_idx_cache`) eliminate heap churn on filtered table scans.
+- **Full Slotted-Page Record Capacity**: Arbitrary sampling limits removed; tables scale dynamically across 4KB slotted pages with zero row caps.
 
 ---
 

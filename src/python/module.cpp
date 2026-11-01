@@ -112,6 +112,65 @@ py::tuple row_to_tuple(const Row& r) {
     return t;
 }
 
+inline std::int64_t fast_val_as_int64(const nemo::types::Value& v) {
+    if (v.is_null()) return 0;
+    switch (v.type()) {
+        case nemo::types::TypeID::BigInt: return v.get<std::int64_t>();
+        case nemo::types::TypeID::Integer: return static_cast<std::int64_t>(v.get<std::int32_t>());
+        case nemo::types::TypeID::SmallInt: return static_cast<std::int64_t>(v.get<std::int16_t>());
+        case nemo::types::TypeID::Double: return static_cast<std::int64_t>(v.get<double>());
+        case nemo::types::TypeID::Real: return static_cast<std::int64_t>(v.get<float>());
+        default: {
+            try { return std::stoll(v.to_string()); } catch (...) { return 0; }
+        }
+    }
+}
+
+inline PyObject* fast_val_to_py(const nemo::types::Value& v) {
+    if (v.is_null()) {
+        Py_INCREF(Py_None);
+        return Py_None;
+    }
+    switch (v.type()) {
+        case nemo::types::TypeID::BigInt:
+            return PyLong_FromLongLong(v.get<std::int64_t>());
+        case nemo::types::TypeID::Integer:
+            return PyLong_FromLong(v.get<std::int32_t>());
+        case nemo::types::TypeID::SmallInt:
+            return PyLong_FromLong(v.get<std::int16_t>());
+        case nemo::types::TypeID::Double:
+            return PyFloat_FromDouble(v.get<double>());
+        case nemo::types::TypeID::Real:
+            return PyFloat_FromDouble(v.get<float>());
+        case nemo::types::TypeID::Text:
+        case nemo::types::TypeID::VarChar:
+        case nemo::types::TypeID::Char: {
+            const auto& s = v.get<std::string>();
+            return PyUnicode_FromStringAndSize(s.data(), s.size());
+        }
+        case nemo::types::TypeID::Boolean: {
+            PyObject* b = v.get<bool>() ? Py_True : Py_False;
+            Py_INCREF(b);
+            return b;
+        }
+        case nemo::types::TypeID::UUID:
+        case nemo::types::TypeID::Date:
+        case nemo::types::TypeID::Time:
+        case nemo::types::TypeID::Timestamp:
+        case nemo::types::TypeID::JSON:
+        case nemo::types::TypeID::JSONB: {
+            std::string s = v.to_string();
+            return PyUnicode_FromStringAndSize(s.data(), s.size());
+        }
+        case nemo::types::TypeID::Bytea: {
+            std::string s = v.to_string();
+            return PyBytes_FromStringAndSize(s.data(), s.size());
+        }
+        default:
+            return value_to_py(v).release().ptr();
+    }
+}
+
 } // anonymous namespace
 
 PYBIND11_MODULE(_nemo, m) {
@@ -168,6 +227,7 @@ PYBIND11_MODULE(_nemo, m) {
         })
         .def("__len__", &Row::size);
 
+
     auto fetchmany_impl = [](Result& self, std::size_t size) -> py::object {
         auto* impl = self.get_impl();
         if (!impl) return py::list();
@@ -179,7 +239,46 @@ PYBIND11_MODULE(_nemo, m) {
         PyObject* py_list = PyList_New(fetch_count);
         if (!py_list) throw std::bad_alloc();
 
-        const auto& sample = impl->rows;
+        // 1. Direct single-row point query
+        if (impl->single_row_idx != static_cast<std::size_t>(-1) && impl->table_ref) {
+            if (impl->single_row_idx < impl->table_ref->sample_rows.size()) {
+                const auto& r = impl->table_ref->sample_rows[impl->single_row_idx];
+                std::size_t n = r.size();
+                PyObject* py_tuple = PyTuple_New(n);
+                for (std::size_t c = 0; c < n; ++c) {
+                    PyTuple_SET_ITEM(py_tuple, c, fast_val_to_py(r[c]));
+                }
+                impl->current_row++;
+                PyList_SET_ITEM(py_list, 0, py_tuple);
+            }
+            return py::reinterpret_steal<py::object>(py_list);
+        }
+
+        // 2. Direct zero-copy join result
+        if (impl->is_join && impl->join_tbl1 && impl->join_tbl2) {
+            std::size_t proj_sz = impl->join_proj.size();
+            for (std::size_t i = 0; i < fetch_count; ++i) {
+                const auto& p = impl->join_pairs[impl->current_row++];
+                const auto* r1_ptr = (p.first != static_cast<std::size_t>(-1) && p.first < impl->join_tbl1->sample_rows.size()) ? &impl->join_tbl1->sample_rows[p.first] : nullptr;
+                const auto* r2_ptr = (p.second != static_cast<std::size_t>(-1) && p.second < impl->join_tbl2->sample_rows.size()) ? &impl->join_tbl2->sample_rows[p.second] : nullptr;
+
+                PyObject* py_tuple = PyTuple_New(proj_sz);
+                for (std::size_t c = 0; c < proj_sz; ++c) {
+                    const auto& jc = impl->join_proj[c];
+                    const auto* src = jc.from_tbl1 ? r1_ptr : r2_ptr;
+                    if (src && jc.col_idx < src->size()) {
+                        PyTuple_SET_ITEM(py_tuple, c, fast_val_to_py((*src)[jc.col_idx]));
+                    } else {
+                        Py_INCREF(Py_None);
+                        PyTuple_SET_ITEM(py_tuple, c, Py_None);
+                    }
+                }
+                PyList_SET_ITEM(py_list, i, py_tuple);
+            }
+            return py::reinterpret_steal<py::object>(py_list);
+        }
+
+        const auto& sample = impl->get_effective_rows();
         std::size_t sample_size = sample.size();
 
         if (sample_size == 0) {
@@ -193,155 +292,13 @@ PYBIND11_MODULE(_nemo, m) {
             return py::reinterpret_steal<py::object>(py_list);
         }
 
-        if (!impl->is_exact && impl->total_rows > sample_size) {
-            std::size_t num_cols = sample[0].size();
-            std::vector<std::vector<PyObject*>> sample_py(sample_size);
-            for (std::size_t s = 0; s < sample_size; ++s) {
-                sample_py[s].resize(num_cols, nullptr);
-                for (std::size_t c = 1; c < num_cols; ++c) {
-                    const auto& v = sample[s][c];
-                    PyObject* py_val = nullptr;
-                    if (v.is_null()) {
-                        py_val = Py_None;
-                        Py_INCREF(Py_None);
-                    } else {
-                        switch (v.type()) {
-                            case nemo::types::TypeID::BigInt:
-                                py_val = PyLong_FromLongLong(v.get<std::int64_t>());
-                                break;
-                            case nemo::types::TypeID::Integer:
-                                py_val = PyLong_FromLong(v.get<std::int32_t>());
-                                break;
-                            case nemo::types::TypeID::SmallInt:
-                                py_val = PyLong_FromLong(v.get<std::int16_t>());
-                                break;
-                            case nemo::types::TypeID::Double:
-                                py_val = PyFloat_FromDouble(v.get<double>());
-                                break;
-                            case nemo::types::TypeID::Real:
-                                py_val = PyFloat_FromDouble(v.get<float>());
-                                break;
-                            case nemo::types::TypeID::Text:
-                            case nemo::types::TypeID::VarChar:
-                            case nemo::types::TypeID::Char: {
-                                const auto& str = v.get<std::string>();
-                                py_val = PyUnicode_FromStringAndSize(str.data(), str.size());
-                                break;
-                            }
-                            case nemo::types::TypeID::Boolean:
-                                py_val = v.get<bool>() ? Py_True : Py_False;
-                                Py_INCREF(py_val);
-                                break;
-                            case nemo::types::TypeID::UUID:
-                            case nemo::types::TypeID::Date:
-                            case nemo::types::TypeID::Time:
-                            case nemo::types::TypeID::Timestamp:
-                            case nemo::types::TypeID::JSON:
-                            case nemo::types::TypeID::JSONB: {
-                                std::string str = v.to_string();
-                                py_val = PyUnicode_FromStringAndSize(str.data(), str.size());
-                                break;
-                            }
-                            case nemo::types::TypeID::Bytea: {
-                                std::string str = v.to_string();
-                                py_val = PyBytes_FromStringAndSize(str.data(), str.size());
-                                break;
-                            }
-                            default:
-                                py_val = value_to_py(v).release().ptr();
-                                break;
-                        }
-                    }
-                    sample_py[s][c] = py_val;
-                }
-            }
-
-            for (std::size_t i = 0; i < fetch_count; ++i) {
-                std::size_t row_idx = impl->current_row++;
-                std::int64_t current_id = static_cast<std::int64_t>(row_idx + 1);
-                std::size_t s_idx = row_idx % sample_size;
-                PyObject* py_tuple = PyTuple_New(num_cols);
-                PyTuple_SET_ITEM(py_tuple, 0, PyLong_FromLongLong(current_id));
-                const auto& row_objs = sample_py[s_idx];
-                for (std::size_t c = 1; c < num_cols; ++c) {
-                    PyObject* obj = row_objs[c];
-                    Py_INCREF(obj);
-                    PyTuple_SET_ITEM(py_tuple, c, obj);
-                }
-                PyList_SET_ITEM(py_list, i, py_tuple);
-            }
-
-            for (std::size_t s = 0; s < sample_size; ++s) {
-                for (std::size_t c = 1; c < num_cols; ++c) {
-                    Py_XDECREF(sample_py[s][c]);
-                }
-            }
-
-            return py::reinterpret_steal<py::object>(py_list);
-        }
-
         for (std::size_t i = 0; i < fetch_count; ++i) {
             std::size_t row_idx = impl->current_row++;
-            std::int64_t current_id = static_cast<std::int64_t>(row_idx + 1);
-
             const auto& sample_row = sample[row_idx];
             std::size_t num_cols = sample_row.size();
             PyObject* py_tuple = PyTuple_New(num_cols);
             for (std::size_t c = 0; c < num_cols; ++c) {
-                const auto& v = sample_row[c];
-                PyObject* py_val = nullptr;
-                if (v.is_null()) {
-                    py_val = Py_None;
-                    Py_INCREF(Py_None);
-                } else {
-                    switch (v.type()) {
-                        case nemo::types::TypeID::BigInt:
-                            py_val = PyLong_FromLongLong(v.get<std::int64_t>());
-                            break;
-                        case nemo::types::TypeID::Integer:
-                            py_val = PyLong_FromLong(v.get<std::int32_t>());
-                            break;
-                        case nemo::types::TypeID::SmallInt:
-                            py_val = PyLong_FromLong(v.get<std::int16_t>());
-                            break;
-                        case nemo::types::TypeID::Double:
-                            py_val = PyFloat_FromDouble(v.get<double>());
-                            break;
-                        case nemo::types::TypeID::Real:
-                            py_val = PyFloat_FromDouble(v.get<float>());
-                            break;
-                        case nemo::types::TypeID::Text:
-                        case nemo::types::TypeID::VarChar:
-                        case nemo::types::TypeID::Char: {
-                            const auto& s = v.get<std::string>();
-                            py_val = PyUnicode_FromStringAndSize(s.data(), s.size());
-                            break;
-                        }
-                        case nemo::types::TypeID::Boolean:
-                            py_val = v.get<bool>() ? Py_True : Py_False;
-                            Py_INCREF(py_val);
-                            break;
-                        case nemo::types::TypeID::UUID:
-                        case nemo::types::TypeID::Date:
-                        case nemo::types::TypeID::Time:
-                        case nemo::types::TypeID::Timestamp:
-                        case nemo::types::TypeID::JSON:
-                        case nemo::types::TypeID::JSONB: {
-                            std::string s = v.to_string();
-                            py_val = PyUnicode_FromStringAndSize(s.data(), s.size());
-                            break;
-                        }
-                        case nemo::types::TypeID::Bytea: {
-                            std::string s = v.to_string();
-                            py_val = PyBytes_FromStringAndSize(s.data(), s.size());
-                            break;
-                        }
-                        default:
-                            py_val = value_to_py(v).release().ptr();
-                            break;
-                    }
-                }
-                PyTuple_SET_ITEM(py_tuple, c, py_val);
+                PyTuple_SET_ITEM(py_tuple, c, fast_val_to_py(sample_row[c]));
             }
             PyList_SET_ITEM(py_list, i, py_tuple);
         }
@@ -351,15 +308,28 @@ PYBIND11_MODULE(_nemo, m) {
     py::class_<Result>(m, "Result")
         .def("has_rows", &Result::has_rows)
         .def("affected_rows", &Result::affected_rows)
-        .def("columns", &Result::columns)
+        .def("columns", [](Result& self) -> std::vector<ColumnMetadata> {
+            auto* impl = self.get_impl();
+            if (impl) {
+                if (!impl->columns.empty()) return impl->columns;
+                if (impl->table_ref) return impl->table_ref->columns;
+            }
+            return self.columns();
+        })
         .def("statistics", &Result::statistics)
         .def("next", [](Result& self) -> std::unique_ptr<Row> {
             return self.next();
         })
-        .def("fetchone", [](Result& self) -> py::object {
-            auto row = self.next();
-            if (!row) return py::none();
-            return row_to_tuple(*row);
+        .def("fetchone", [fetchmany_impl](Result& self) -> py::object {
+            py::object res = fetchmany_impl(self, 1);
+            if (PyList_Check(res.ptr())) {
+                if (PyList_GET_SIZE(res.ptr()) > 0) {
+                    PyObject* item = PyList_GET_ITEM(res.ptr(), 0);
+                    Py_INCREF(item);
+                    return py::reinterpret_steal<py::object>(item);
+                }
+            }
+            return py::none();
         })
         .def("fetchmany", fetchmany_impl, py::arg("size") = 1)
         .def("fetchall", [fetchmany_impl](Result& self) -> py::object {
@@ -367,6 +337,16 @@ PYBIND11_MODULE(_nemo, m) {
             if (!impl) return py::list();
             std::size_t remaining = (impl->total_rows > impl->current_row) ? (impl->total_rows - impl->current_row) : 0;
             return fetchmany_impl(self, remaining);
+        })
+        .def("__iter__", [](py::object self) { return self; })
+        .def("__next__", [fetchmany_impl](Result& self) -> py::object {
+            py::object res = fetchmany_impl(self, 1);
+            if (PyList_Check(res.ptr()) && PyList_GET_SIZE(res.ptr()) > 0) {
+                PyObject* item = PyList_GET_ITEM(res.ptr(), 0);
+                Py_INCREF(item);
+                return py::reinterpret_steal<py::object>(item);
+            }
+            throw py::stop_iteration();
         });
 
     py::class_<Transaction>(m, "Transaction")
@@ -415,16 +395,23 @@ PYBIND11_MODULE(_nemo, m) {
     py::class_<Connection>(m, "Connection")
         .def("execute", [](Connection& self, const std::string& sql, py::object params, double timeout) -> Result {
             (void)timeout;
-            std::vector<nemo::types::Value> values;
-            bool has_params = false;
-            if (!params.is_none() && py::isinstance<py::sequence>(params)) {
-                has_params = true;
+            bool has_params = !params.is_none() && py::isinstance<py::sequence>(params);
+            if (has_params) {
+                std::vector<nemo::types::Value> values;
                 for (auto item : params.cast<py::sequence>()) {
                     values.push_back(py_to_value(item));
                 }
+                auto res = self.execute(sql, values);
+                if (!res) throw std::runtime_error("Execute failed");
+                return std::move(res.value());
+            }
+            if (sql.size() < 2048) {
+                auto res = self.execute(sql);
+                if (!res) throw std::runtime_error("Execute failed");
+                return std::move(res.value());
             }
             py::gil_scoped_release release;
-            auto res = has_params ? self.execute(sql, values) : self.execute(sql);
+            auto res = self.execute(sql);
             if (!res) throw std::runtime_error("Execute failed");
             return std::move(res.value());
         }, py::arg("sql"), py::arg("parameters") = py::none(), py::arg("timeout") = 0.0)
@@ -475,50 +462,73 @@ PYBIND11_MODULE(_nemo, m) {
                     auto_seq = conn_impl->shared_state->get_or_create_sequence(tbl_data->autoincrement_seq_name, 1, 1);
                 }
 
-                if (tbl_data->sample_rows.size() < 5000 && fast_items) {
-                    Py_ssize_t to_sample = std::min<Py_ssize_t>(num_rows, 5000 - tbl_data->sample_rows.size());
-                    tbl_data->sample_rows.reserve(tbl_data->sample_rows.size() + to_sample);
+                tbl_data->sample_rows.reserve(tbl_data->sample_rows.size() + num_rows);
 
-                    for (Py_ssize_t r = 0; r < to_sample; ++r) {
-                        PyObject* row_obj = fast_items[r];
-                        std::vector<nemo::types::Value> row_vals;
-                        if (PyTuple_Check(row_obj)) {
-                            Py_ssize_t cols = PyTuple_GET_SIZE(row_obj);
-                            row_vals.reserve(cols + 1);
-                            for (Py_ssize_t c = 0; c < cols; ++c) {
-                                PyObject* val = PyTuple_GET_ITEM(row_obj, c);
-                                if (PyBool_Check(val)) {
-                                    row_vals.push_back(nemo::types::Value(val == Py_True));
-                                } else if (PyLong_Check(val)) {
-                                    row_vals.push_back(nemo::types::Value(static_cast<std::int64_t>(PyLong_AsLongLong(val))));
-                                } else if (PyFloat_Check(val)) {
-                                    row_vals.push_back(nemo::types::Value(PyFloat_AsDouble(val)));
-                                } else if (PyUnicode_Check(val)) {
-                                    Py_ssize_t sz = 0;
-                                    const char* str_ptr = PyUnicode_AsUTF8AndSize(val, &sz);
-                                    row_vals.push_back(nemo::types::Value(std::string(str_ptr, sz)));
-                                } else {
-                                    row_vals.push_back(nemo::types::Value());
-                                }
-                            }
-                            if (auto_seq && tbl_data->autoincrement_col_idx == 0 && row_vals.size() == tbl_data->columns.size() - 1) {
-                                row_vals.insert(row_vals.begin(), nemo::types::Value(auto_seq->nextval()));
-                            } else if (auto_seq && tbl_data->autoincrement_col_idx < row_vals.size()) {
-                                try {
-                                    std::int64_t explicit_id = std::stoll(row_vals[tbl_data->autoincrement_col_idx].to_string());
-                                    auto_seq->advance_at_least(explicit_id);
-                                } catch (...) {}
-                            }
+                auto extract_val = [](PyObject* val) -> nemo::types::Value {
+                    if (!val || val == Py_None) {
+                        return nemo::types::Value();
+                    } else if (PyBool_Check(val)) {
+                        return nemo::types::Value(val == Py_True);
+                    } else if (PyLong_Check(val)) {
+                        return nemo::types::Value(static_cast<std::int64_t>(PyLong_AsLongLong(val)));
+                    } else if (PyFloat_Check(val)) {
+                        return nemo::types::Value(PyFloat_AsDouble(val));
+                    } else if (PyUnicode_Check(val)) {
+                        Py_ssize_t sz = 0;
+                        const char* str_ptr = PyUnicode_AsUTF8AndSize(val, &sz);
+                        return nemo::types::Value(std::string(str_ptr ? str_ptr : "", sz));
+                    } else if (PyBytes_Check(val)) {
+                        char* buf = nullptr;
+                        Py_ssize_t len = 0;
+                        PyBytes_AsStringAndSize(val, &buf, &len);
+                        return nemo::types::Value(std::vector<std::uint8_t>(buf, buf + len));
+                    } else {
+                        py::handle h(val);
+                        return py_to_value(h);
+                    }
+                };
+
+                for (Py_ssize_t r = 0; r < num_rows; ++r) {
+                    PyObject* row_obj = fast_items ? fast_items[r] : PySequence_GetItem(raw_ptr, r);
+                    std::vector<nemo::types::Value> row_vals;
+                    if (PyTuple_Check(row_obj)) {
+                        Py_ssize_t cols = PyTuple_GET_SIZE(row_obj);
+                        row_vals.reserve(cols + 1);
+                        for (Py_ssize_t c = 0; c < cols; ++c) {
+                            row_vals.push_back(extract_val(PyTuple_GET_ITEM(row_obj, c)));
                         }
-                        tbl_data->sample_rows.push_back(std::move(row_vals));
+                    } else if (PyList_Check(row_obj)) {
+                        Py_ssize_t cols = PyList_GET_SIZE(row_obj);
+                        row_vals.reserve(cols + 1);
+                        for (Py_ssize_t c = 0; c < cols; ++c) {
+                            row_vals.push_back(extract_val(PyList_GET_ITEM(row_obj, c)));
+                        }
+                    } else if (PySequence_Check(row_obj)) {
+                        Py_ssize_t cols = PySequence_Size(row_obj);
+                        row_vals.reserve(cols + 1);
+                        for (Py_ssize_t c = 0; c < cols; ++c) {
+                            PyObject* item = PySequence_GetItem(row_obj, c);
+                            row_vals.push_back(extract_val(item));
+                            Py_XDECREF(item);
+                        }
                     }
-                    if (auto_seq && num_rows > to_sample) {
-                        auto_seq->nextval_range(num_rows - to_sample);
+
+                    if (auto_seq && tbl_data->autoincrement_col_idx == 0 && row_vals.size() == tbl_data->columns.size() - 1) {
+                        row_vals.insert(row_vals.begin(), nemo::types::Value(auto_seq->nextval()));
+                    } else if (auto_seq && tbl_data->autoincrement_col_idx < row_vals.size()) {
+                        std::int64_t explicit_id = fast_val_as_int64(row_vals[tbl_data->autoincrement_col_idx]);
+                        if (explicit_id > 0) {
+                            auto_seq->advance_at_least(explicit_id);
+                        }
                     }
-                } else if (auto_seq) {
-                    auto_seq->nextval_range(num_rows);
+
+                    tbl_data->sample_rows.push_back(std::move(row_vals));
+
+                    if (!fast_items) {
+                        Py_XDECREF(row_obj);
+                    }
                 }
-                tbl_data->total_rows += num_rows;
+                tbl_data->total_rows = tbl_data->sample_rows.size();
             }
         }, py::arg("sql"), py::arg("parameters_list"))
         .def("pop", [](Connection& self, const std::string& table_name, std::size_t count, const std::string& direction) -> py::object {

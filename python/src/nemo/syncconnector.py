@@ -16,9 +16,10 @@
 import logging
 import uuid
 from typing import Sequence, Optional, Iterator
-from .logging import conn_logger, txn_logger, pool_logger, QueryContext
+from .logging import conn_logger, txn_logger, pool_logger, QueryContext, get_config
 
 class SyncResult(Iterator):
+    __slots__ = ("_native",)
     def __init__(self, native_result):
         self._native = native_result
 
@@ -128,6 +129,7 @@ class SyncTransaction:
         return False
 
 class SyncConnection:
+    __slots__ = ("_native", "_id")
     def __init__(self, native_conn):
         self._native = native_conn
         self._id = uuid.uuid4().hex[:8]
@@ -135,11 +137,18 @@ class SyncConnection:
             conn_logger.debug(f"Connection acquired", extra={"conn_id": self._id})
 
     def execute(self, sql: str, parameters: Optional[Sequence[object]] = None, timeout: float = 0.0) -> SyncResult:
-        with QueryContext("EXECUTE", sql, parameters or (), self._id):
-            return SyncResult(self._native.execute(sql, parameters or (), timeout))
+        cfg = get_config()
+        if cfg.query_logging or cfg.slow_query_threshold_ms is not None:
+            with QueryContext("EXECUTE", sql, parameters or (), self._id):
+                return SyncResult(self._native.execute(sql, parameters or (), timeout))
+        return SyncResult(self._native.execute(sql, parameters or (), timeout))
 
     def executemany(self, sql: str, parameters_list: Sequence[Sequence[object]]):
-        with QueryContext("EXECUTEMANY", sql, [], self._id):
+        cfg = get_config()
+        if cfg.query_logging or cfg.slow_query_threshold_ms is not None:
+            with QueryContext("EXECUTEMANY", sql, [], self._id):
+                self._native.executemany(sql, parameters_list)
+        else:
             self._native.executemany(sql, parameters_list)
 
     def pop(self, table: str, count: int = 1, direction: str = "fifo") -> list[tuple]:
@@ -272,6 +281,5 @@ class SyncConnectionPool:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-# Aliases
 SyncConnector = SyncConnection
 SyncConnectorPool = SyncConnectionPool

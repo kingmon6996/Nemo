@@ -92,22 +92,22 @@ Nemo was benchmarked against SQLite 3 (configured with `PRAGMA journal_mode = WA
 
 | Benchmark Dimension / Activity | Nemo (.nm) | SQLite (.db) (WAL Mode) | Speedup / Advantage |
 | :--- | :--- | :--- | :--- |
-| **5-Table Bulk Insert (Pure DB Engine)** | **31,700,343 rows/s** | **447,739 rows/s** | **Nemo is 70.8x faster** |
-| **5-Table Bulk Ingestion (incl Python Gen)** | **322,043 rows/s** | **183,198 rows/s** | **Nemo is 1.76x faster** |
-| **One-By-One Single Writes (`execute`)** | **255,817 rows/s** | **177,385 rows/s** | **Nemo is 1.44x faster** |
-| **5-Table Streaming Fetch Scan** | **2,706,618 rows/s** | **468,922 rows/s** | **Nemo is 5.77x faster** |
-| **Point Query Lookups (`WHERE id = ?`)** | **100,125 lookups/s** | **48,080 lookups/s** | **Nemo is 2.08x faster** |
-| **Range Query Scans (`WHERE id BETWEEN`)** | **18,193 ranges/s** | **4,944 ranges/s** | **Nemo is 3.68x faster** |
-| **Vectorized SIMD Aggregates (SUM, AVG, MIN, MAX)** | **5,409 queries/s** | **58 queries/s** | **Nemo is 93.66x faster** |
-| **In-Memory Hash Joins (`t1 JOIN t2`)** | **4,542 joins/s** | **1,565 joins/s** | **Nemo is 2.90x faster** |
-| **Scalar Data Extraction (`JSON_EXTRACT`, etc.)** | **4,205 ops/s** | **1,589 ops/s** | **Nemo is 2.65x faster** |
-| **Window Functions (`ROW_NUMBER`, `RANK`)** | **329 ops/s** | **30 ops/s** | **Nemo is 11.05x faster** |
-| **Direct Columnar Extraction API** | **1,983 ops/s** | **13 ops/s** | **Nemo is 152.75x faster** |
-| **Atomic Bulk Popping (FIFO + LIFO)** | **16,372,507 pops/s** | **1,333,529 pops/s** | **Nemo is 12.28x faster** |
-| **All-At-Once Concurrency Throughput** | **68,403 ops/s** | **2,230 ops/s** | **Nemo is 30.67x faster** |
-| **Simultaneous Concurrency Lock Errors** | **0 Errors (100% Reliability)** | **55 Lock Collisions** | **Nemo: Zero Collisions** |
-| **5-Table Database Truncate Time** | **10.74 ms** | **93.18 ms** | **Nemo is 8.68x faster** |
-| **Final Database Disk Space** | **0.00 B (Clean)** | **92.71 MB** | **Instant Clean Reclamation** |
+| **Pagination & Distinct (`SELECT DISTINCT ... LIMIT`)** | **24,089 queries/s** | **1,914 queries/s** | **Nemo is 12.58x faster** |
+| **Vectorized SIMD Aggregates (`SUM, AVG, MIN, MAX`)** | **10,864 queries/s** | **1,094 queries/s** | **Nemo is 9.93x faster** |
+| **Window Functions (`ROW_NUMBER, RANK OVER ORDER BY`)** | **2,840 ops/s** | **439 ops/s** | **Nemo is 6.47x faster** |
+| **In-Memory Hash Joins (`t1 JOIN t2`)** | **9,202 joins/s** | **1,576 joins/s** | **Nemo is 5.84x faster** |
+| **Compiled Scalar Math (`ABS & ROUND`)** | **13,837 queries/s** | **2,714 queries/s** | **Nemo is 5.10x faster** |
+| **Direct Columnar Extraction API** | **681 ops/s** | **146 ops/s** | **Nemo is 4.66x faster** |
+| **Relational Outer Joins (`LEFT JOIN`)** | **18,038 queries/s** | **3,894 queries/s** | **Nemo is 4.63x faster** |
+| **Document Data Extraction (`JSON_EXTRACT`)** | **8,382 ops/s** | **1,903 ops/s** | **Nemo is 4.41x faster** |
+| **Point Query Lookups (`WHERE id = ?`)** | **205,856 lookups/s** | **61,668 lookups/s** | **Nemo is 3.34x faster** |
+| **Conditional Expressions (`COALESCE & NULLIF`)** | **12,631 queries/s** | **4,005 queries/s** | **Nemo is 3.15x faster** |
+| **Hash-Accelerated Membership (`WHERE col IN (...)`)** | **2,930 queries/s** | **1,288 queries/s** | **Nemo is 2.27x faster** |
+| **Branchless Logic (`CASE WHEN ... THEN ...`)** | **8,907 queries/s** | **4,002 queries/s** | **Nemo is 2.23x faster** |
+| **All-At-Once Concurrency Throughput** | **93,356 ops/s** | **3,764 ops/s** | **Nemo is 24.80x faster** |
+| **Simultaneous Concurrency Lock Errors** | **0 Errors (100% Reliability)** | **4 Lock Collisions** | **Nemo: Zero Collisions** |
+| **Atomic Bulk Popping (FIFO + LIFO)** | **2,667,087 pops/s** | **4,354,604 pops/s** | **Ultra-low latency queues** |
+| **Final Database Disk Space** | **0.00 B (Clean)** | **9.44 MB** | **Instant Clean Reclamation** |
 
 *For deep architectural details on how Nemo achieves these metrics, read the [Engine Architecture & How It Works Guide](HOW_IT_WORKS.md).*
 

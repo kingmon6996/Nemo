@@ -1,3 +1,4 @@
+#include <charconv>
 #include "nemo/api/connection.hpp"
 #include "nemo/runtime/connection_lease.hpp"
 #include "nemo/runtime/worker_pool.hpp"
@@ -93,7 +94,7 @@ std::vector<types::Value> parse_simple_values(std::string_view sql) {
     if (end == std::string_view::npos || end <= start) return vals;
     
     std::string_view inside = sql.substr(start + 1, end - start - 1);
-    vals.reserve(16);
+    vals.reserve(32);
 
     size_t token_start = 0;
     in_quote = false;
@@ -113,13 +114,23 @@ std::vector<types::Value> parse_simple_values(std::string_view sql) {
         } else if (token == "null" || token == "NULL") {
             vals.emplace_back();
         } else if (token.find('.') != std::string_view::npos) {
-            try { 
-                vals.emplace_back(std::stod(std::string(token))); 
-            } catch (...) { vals.emplace_back(); }
+            double d = 0.0;
+            auto [p, ec] = std::from_chars(token.data(), token.data() + token.size(), d);
+            if (ec == std::errc()) {
+                vals.emplace_back(d);
+            } else {
+                std::string tmp_tok(token);
+                vals.emplace_back(std::strtod(tmp_tok.c_str(), nullptr));
+            }
         } else {
-            try { 
-                vals.emplace_back(static_cast<std::int64_t>(std::stoll(std::string(token)))); 
-            } catch (...) { vals.emplace_back(); }
+            std::int64_t iv = 0;
+            auto [p, ec] = std::from_chars(token.data(), token.data() + token.size(), iv);
+            if (ec == std::errc()) {
+                vals.emplace_back(iv);
+            } else {
+                std::string tmp_tok(token);
+                vals.emplace_back(static_cast<std::int64_t>(std::strtoll(tmp_tok.c_str(), nullptr, 10)));
+            }
         }
     };
 
@@ -177,6 +188,142 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
     if (!m_impl || !m_impl->shared_state) {
         return create_result(0, false);
     }
+
+    // ULTRA-FAST ZERO-COPY SINGLE ROW INSERT FAST PATH
+    if (first_c == 'i') {
+        std::string_view trimmed_sql = sql.substr(i);
+        if (ifind(trimmed_sql, " returning ") == std::string_view::npos &&
+            ifind(trimmed_sql, "select ") == std::string_view::npos &&
+            ifind(trimmed_sql, "on conflict") == std::string_view::npos) {
+            size_t val_pos = ifind(trimmed_sql, "values");
+            if (val_pos != std::string_view::npos) {
+                size_t into_pos = ifind(trimmed_sql, "into ");
+                if (into_pos != std::string_view::npos && into_pos < val_pos) {
+                    size_t lparen = trimmed_sql.find('(', into_pos);
+                    bool has_col_list = (lparen != std::string_view::npos && lparen < val_pos);
+                    if (!has_col_list) {
+                        size_t tn_start = into_pos + 5;
+                        while (tn_start < val_pos && std::isspace(static_cast<unsigned char>(trimmed_sql[tn_start]))) tn_start++;
+                        size_t tn_end = tn_start;
+                        while (tn_end < val_pos && (std::isalnum(static_cast<unsigned char>(trimmed_sql[tn_end])) || trimmed_sql[tn_end] == '_')) tn_end++;
+
+                        if (tn_end > tn_start) {
+                            std::string tname(trimmed_sql.substr(tn_start, tn_end - tn_start));
+                            auto tbl = m_impl->shared_state->get_or_create_table(tname);
+                            if (tbl) {
+                                std::vector<types::Value> row_vals;
+                                if (!parameters.empty()) {
+                                    row_vals.assign(parameters.begin(), parameters.end());
+                                } else {
+                                    row_vals = parse_simple_values(trimmed_sql);
+                                }
+
+                                if (!row_vals.empty()) {
+                                    std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
+                                    std::shared_ptr<Sequence> auto_seq = nullptr;
+                                    if (tbl->autoincrement_col_idx != static_cast<std::size_t>(-1) && !tbl->autoincrement_seq_name.empty()) {
+                                        auto_seq = m_impl->shared_state->get_or_create_sequence(tbl->autoincrement_seq_name, 1, 1);
+                                    }
+
+                                    if (auto_seq && tbl->autoincrement_col_idx == 0 && row_vals.size() == tbl->columns.size() - 1) {
+                                        row_vals.insert(row_vals.begin(), types::Value(auto_seq->nextval()));
+                                    } else if (auto_seq && tbl->autoincrement_col_idx < row_vals.size()) {
+                                        std::int64_t explicit_id = query_engine::value_as_int64(row_vals[tbl->autoincrement_col_idx]);
+                                        if (explicit_id > 0) {
+                                            auto_seq->advance_at_least(explicit_id);
+                                        }
+                                    }
+
+                                    if (row_vals.size() < tbl->columns.size()) {
+                                        row_vals.resize(tbl->columns.size());
+                                    }
+
+                                    tbl->sample_rows.push_back(std::move(row_vals));
+                                    tbl->total_rows = tbl->sample_rows.size();
+                                    return create_result(1, false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ULTRA-FAST ZERO-COPY DIRECT ID POINT LOOKUP FAST PATH
+    if (first_c == 's' && sql.size() > 18) {
+        std::string_view trimmed_sql = sql.substr(i);
+        if ((trimmed_sql[0] == 's' || trimmed_sql[0] == 'S') &&
+            (trimmed_sql.find("select * from ") != std::string_view::npos || trimmed_sql.find("SELECT * FROM ") != std::string_view::npos)) {
+            size_t id_p = ifind(trimmed_sql, "where id");
+            if (id_p != std::string_view::npos) {
+                size_t sel_star_p = ifind(trimmed_sql, "select * from ");
+                if (sel_star_p != std::string_view::npos && sel_star_p < id_p) {
+                    size_t t_start = sel_star_p + 14;
+                    while (t_start < id_p && std::isspace(static_cast<unsigned char>(trimmed_sql[t_start]))) t_start++;
+                    size_t t_end = id_p;
+                    while (t_end > t_start && std::isspace(static_cast<unsigned char>(trimmed_sql[t_end - 1]))) t_end--;
+
+                    size_t eq_p = trimmed_sql.find('=', id_p + 8);
+                    if (eq_p != std::string_view::npos) {
+                        size_t val_start = eq_p + 1;
+                        while (val_start < trimmed_sql.size() && std::isspace(static_cast<unsigned char>(trimmed_sql[val_start]))) val_start++;
+                        size_t val_end = val_start;
+                        while (val_end < trimmed_sql.size() && std::isdigit(static_cast<unsigned char>(trimmed_sql[val_end]))) val_end++;
+
+                        if (val_end > val_start && t_end > t_start) {
+                            std::string fast_tname(trimmed_sql.substr(t_start, t_end - t_start));
+                            auto fast_tbl = m_impl->shared_state->get_table(fast_tname);
+                            if (fast_tbl) {
+                                std::int64_t tid = 0;
+                                for (size_t vi = val_start; vi < val_end; ++vi) {
+                                    tid = tid * 10 + (trimmed_sql[vi] - '0');
+                                }
+                                std::shared_lock<std::shared_mutex> r_lk(fast_tbl->mutex);
+                                if (tid >= 1 && !fast_tbl->sample_rows.empty()) {
+                                    std::size_t idx = static_cast<std::size_t>(tid - 1);
+                                    if (idx < fast_tbl->sample_rows.size() && !fast_tbl->sample_rows[idx].empty() && query_engine::value_as_int64(fast_tbl->sample_rows[idx][0]) == tid) {
+                                        auto r_impl = std::make_unique<ResultImpl>();
+                                        r_impl->affected_rows = 0;
+                                        r_impl->has_rows = true;
+                                        r_impl->is_exact = true;
+                                        r_impl->single_row_idx = idx;
+                                        r_impl->total_rows = 1;
+                                        r_impl->columns = fast_tbl->columns;
+                                        r_impl->table_ref = fast_tbl;
+                                        return Result(std::move(r_impl));
+                                    }
+                                    for (std::size_t row_i = 0; row_i < fast_tbl->sample_rows.size(); ++row_i) {
+                                        const auto& sr = fast_tbl->sample_rows[row_i];
+                                        if (!sr.empty() && query_engine::value_as_int64(sr[0]) == tid) {
+                                            auto r_impl = std::make_unique<ResultImpl>();
+                                            r_impl->affected_rows = 0;
+                                            r_impl->has_rows = true;
+                                            r_impl->is_exact = true;
+                                            r_impl->single_row_idx = row_i;
+                                            r_impl->total_rows = 1;
+                                            r_impl->columns = fast_tbl->columns;
+                                            r_impl->table_ref = fast_tbl;
+                                            return Result(std::move(r_impl));
+                                        }
+                                    }
+                                }
+                                auto r_impl = std::make_unique<ResultImpl>();
+                                r_impl->affected_rows = 0;
+                                r_impl->has_rows = false;
+                                r_impl->is_exact = true;
+                                r_impl->total_rows = 0;
+                                r_impl->columns = fast_tbl->columns;
+                                r_impl->table_ref = fast_tbl;
+                                return Result(std::move(r_impl));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     // 0. EXPLAIN query (Cost-Based Optimizer Plan Tree)
     if (first_c == 'e' && query_engine::to_lower(sql).starts_with("explain")) {
@@ -416,15 +563,86 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
 
     std::string tbl_name = extract_table_name(sql);
     std::shared_ptr<TableData> tbl = nullptr;
-    {
+    if (is_insert && !m_impl->cached_insert_table_name.empty() && m_impl->cached_insert_table_name == tbl_name) {
+        tbl = m_impl->cached_insert_table;
+    } else {
         std::shared_lock<std::shared_mutex> v_lk(m_impl->shared_state->db_mutex);
         if (m_impl->shared_state->views.find(query_engine::to_lower(tbl_name)) == m_impl->shared_state->views.end()) {
             v_lk.unlock();
             tbl = m_impl->shared_state->get_or_create_table(tbl_name);
+            if (is_insert) {
+                m_impl->cached_insert_table_name = tbl_name;
+                m_impl->cached_insert_table = tbl;
+            }
         }
     }
 
     if (is_select) {
+        // ULTRA-FAST ZERO-COPY DIRECT ID POINT LOOKUP
+        size_t id_p = ifind(sql, "where id");
+        if (id_p != std::string_view::npos) {
+            size_t sel_star_p = ifind(sql, "select * from ");
+            if (sel_star_p != std::string_view::npos && sel_star_p < id_p) {
+                size_t t_start = sel_star_p + 14;
+                while (t_start < id_p && std::isspace(static_cast<unsigned char>(sql[t_start]))) t_start++;
+                size_t t_end = id_p;
+                while (t_end > t_start && std::isspace(static_cast<unsigned char>(sql[t_end - 1]))) t_end--;
+
+                size_t eq_p = sql.find('=', id_p + 8);
+                if (eq_p != std::string_view::npos) {
+                    size_t val_start = eq_p + 1;
+                    while (val_start < sql.size() && std::isspace(static_cast<unsigned char>(sql[val_start]))) val_start++;
+                    size_t val_end = val_start;
+                    while (val_end < sql.size() && std::isdigit(static_cast<unsigned char>(sql[val_end]))) val_end++;
+
+                    if (val_end > val_start && t_end > t_start) {
+                        std::string fast_tname(sql.substr(t_start, t_end - t_start));
+                        auto fast_tbl = m_impl->shared_state->get_table(fast_tname);
+                        if (fast_tbl) {
+                            std::int64_t tid = 0;
+                            for (size_t vi = val_start; vi < val_end; ++vi) {
+                                tid = tid * 10 + (sql[vi] - '0');
+                            }
+                            std::shared_lock<std::shared_mutex> r_lk(fast_tbl->mutex);
+                            if (tid >= 1 && !fast_tbl->sample_rows.empty()) {
+                                std::size_t idx = static_cast<std::size_t>(tid - 1);
+                                if (idx < fast_tbl->sample_rows.size() && !fast_tbl->sample_rows[idx].empty() && query_engine::value_as_int64(fast_tbl->sample_rows[idx][0]) == tid) {
+                                    auto r_impl = std::make_unique<ResultImpl>();
+                                    r_impl->affected_rows = 0;
+                                    r_impl->has_rows = true;
+                                    r_impl->is_exact = true;
+                                    r_impl->total_rows = 1;
+                                    r_impl->table_ref = fast_tbl;
+                                    r_impl->single_row_idx = idx;
+                                    return Result(std::move(r_impl));
+                                }
+                                for (std::size_t si = 0; si < fast_tbl->sample_rows.size(); ++si) {
+                                    const auto& sr = fast_tbl->sample_rows[si];
+                                    if (!sr.empty() && query_engine::value_as_int64(sr[0]) == tid) {
+                                        auto r_impl = std::make_unique<ResultImpl>();
+                                        r_impl->affected_rows = 0;
+                                        r_impl->has_rows = true;
+                                        r_impl->is_exact = true;
+                                        r_impl->total_rows = 1;
+                                        r_impl->table_ref = fast_tbl;
+                                        r_impl->single_row_idx = si;
+                                        return Result(std::move(r_impl));
+                                    }
+                                }
+                                auto r_impl = std::make_unique<ResultImpl>();
+                                r_impl->affected_rows = 0;
+                                r_impl->has_rows = false;
+                                r_impl->is_exact = true;
+                                r_impl->total_rows = 0;
+                                r_impl->table_ref = fast_tbl;
+                                return Result(std::move(r_impl));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         std::string lower_s = query_engine::to_lower(sql);
 
         // 0. Set operations (UNION, UNION ALL, INTERSECT, EXCEPT)
@@ -531,41 +749,65 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         size_t where_pos = ifind(sql, "where");
         bool is_star = (lower_s.find("select *") != std::string::npos || lower_s.find("select all") != std::string::npos);
 
-        if (is_star && where_pos != std::string_view::npos && ifind(sql, "between") != std::string_view::npos && tbl->total_rows > tbl->sample_rows.size()) {
-            std::size_t range_count = std::min<std::size_t>(100, tbl->sample_rows.size());
-            std::vector<std::vector<types::Value>> sliced;
-            sliced.reserve(range_count);
-            for (std::size_t k = 0; k < range_count; ++k) {
-                sliced.push_back(tbl->sample_rows[k]);
-            }
-            return create_result(0, true, result_cols, std::move(sliced), range_count, true);
-        }
 
         if (is_star) {
+            // High-speed direct integer point query
+            size_t id_eq_pos = ifind(sql, "where id = ");
+            if (id_eq_pos != std::string_view::npos) {
+                size_t val_start = id_eq_pos + 11;
+                while (val_start < sql.size() && std::isspace(static_cast<unsigned char>(sql[val_start]))) val_start++;
+                size_t val_end = val_start;
+                while (val_end < sql.size() && std::isdigit(static_cast<unsigned char>(sql[val_end]))) val_end++;
+                if (val_end > val_start) {
+                    std::int64_t tid = 0;
+                    for (size_t vi = val_start; vi < val_end; ++vi) {
+                        tid = tid * 10 + (sql[vi] - '0');
+                    }
+                    if (tid >= 1 && !tbl->sample_rows.empty()) {
+                        std::size_t idx = static_cast<std::size_t>(tid - 1);
+                        if (idx < tbl->sample_rows.size() && !tbl->sample_rows[idx].empty() && query_engine::value_as_int64(tbl->sample_rows[idx][0]) == tid) {
+                            return create_result(0, true, result_cols, {tbl->sample_rows[idx]}, 1, true);
+                        }
+                        for (const auto& sr : tbl->sample_rows) {
+                            if (!sr.empty() && query_engine::value_as_int64(sr[0]) == tid) {
+                                return create_result(0, true, result_cols, {sr}, 1, true);
+                            }
+                        }
+                        return create_result(0, true, result_cols, {}, 0, true);
+                    }
+                }
+            }
+
             query_engine::WherePredicate point_pred;
             if (where_pos != std::string_view::npos && query_engine::parse_simple_where(sql, point_pred)) {
                 if (tbl->get_col_idx(point_pred.column) == 0 && point_pred.op == "=") {
                     try {
                         std::int64_t tid = std::stoll(point_pred.value);
-                        if (tid >= 1 && tbl->total_rows > 0 && !tbl->sample_rows.empty()) {
-                            if (tbl->total_rows > tbl->sample_rows.size()) {
-                                std::size_t idx = (static_cast<std::size_t>(tid - 1)) % tbl->sample_rows.size();
+                        if (tid >= 1 && !tbl->sample_rows.empty()) {
+                            std::size_t idx = static_cast<std::size_t>(tid - 1);
+                            if (idx < tbl->sample_rows.size() && !tbl->sample_rows[idx].empty() && query_engine::value_as_int64(tbl->sample_rows[idx][0]) == tid) {
                                 return create_result(0, true, result_cols, {tbl->sample_rows[idx]}, 1, true);
-                            } else {
-                                for (const auto& sr : tbl->sample_rows) {
-                                    if (!sr.empty() && sr[0].to_string() == point_pred.value) {
-                                        return create_result(0, true, result_cols, {sr}, 1, true);
-                                    }
-                                }
-                                return create_result(0, true, result_cols, {}, 0, true);
                             }
+                            for (const auto& sr : tbl->sample_rows) {
+                                if (!sr.empty() && query_engine::value_as_int64(sr[0]) == tid) {
+                                    return create_result(0, true, result_cols, {sr}, 1, true);
+                                }
+                            }
+                            return create_result(0, true, result_cols, {}, 0, true);
                         }
                     } catch (...) {}
                 }
             }
 
             if (where_pos == std::string_view::npos) {
-                return create_result(0, true, result_cols, tbl->sample_rows, tbl->total_rows, false);
+                auto r_impl = std::make_unique<ResultImpl>();
+                r_impl->affected_rows = 0;
+                r_impl->has_rows = true;
+                r_impl->is_exact = true;
+                r_impl->columns = result_cols;
+                r_impl->total_rows = tbl->sample_rows.size();
+                r_impl->table_ref = tbl;
+                return Result(std::move(r_impl));
             }
         }
 
@@ -673,8 +915,56 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
     };
 
     if (is_insert) {
+        bool fast_has_ret = (ifind(sql, " returning ") != std::string_view::npos);
+        bool fast_has_sel = (ifind(sql, "select ") != std::string_view::npos);
+        bool fast_has_conflict = (ifind(sql, "on conflict") != std::string_view::npos);
+
+        if (!fast_has_ret && !fast_has_sel && !fast_has_conflict) {
+            size_t val_pos = ifind(sql, "values");
+            if (val_pos != std::string_view::npos) {
+                size_t into_pos = ifind(sql, "into ");
+                size_t lparen = (into_pos != std::string_view::npos) ? sql.find('(', into_pos) : std::string_view::npos;
+                bool has_col_list = (lparen != std::string_view::npos && lparen < val_pos);
+
+                if (!has_col_list) {
+                    std::vector<types::Value> row_vals;
+                    if (!parameters.empty()) {
+                        row_vals.assign(parameters.begin(), parameters.end());
+                    } else {
+                        row_vals = parse_simple_values(sql);
+                    }
+
+                    if (!row_vals.empty()) {
+                        std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
+                        std::shared_ptr<Sequence> auto_seq = nullptr;
+                        if (tbl->autoincrement_col_idx != static_cast<std::size_t>(-1) && !tbl->autoincrement_seq_name.empty()) {
+                            auto_seq = m_impl->shared_state->get_or_create_sequence(tbl->autoincrement_seq_name, 1, 1);
+                        }
+
+                        if (auto_seq && tbl->autoincrement_col_idx == 0 && row_vals.size() == tbl->columns.size() - 1) {
+                            row_vals.insert(row_vals.begin(), types::Value(auto_seq->nextval()));
+                        } else if (auto_seq && tbl->autoincrement_col_idx < row_vals.size()) {
+                            std::int64_t explicit_id = query_engine::value_as_int64(row_vals[tbl->autoincrement_col_idx]);
+                            if (explicit_id > 0) {
+                                auto_seq->advance_at_least(explicit_id);
+                            }
+                        }
+
+                        if (row_vals.size() < tbl->columns.size()) {
+                            row_vals.resize(tbl->columns.size());
+                        }
+
+                        tbl->sample_rows.push_back(std::move(row_vals));
+                        tbl->total_rows = tbl->sample_rows.size();
+                        return create_result(1, false);
+                    }
+                }
+            }
+        }
+
         std::string s_low = query_engine::to_lower(sql);
         size_t ret_p = s_low.find(" returning ");
+
 
         // INSERT INTO ... SELECT ...
         size_t sel_in_ins = s_low.find("select ");
@@ -730,10 +1020,8 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                             }
                         }
 
-                        tbl->total_rows++;
-                        if (tbl->sample_rows.size() < 5000) {
-                            tbl->sample_rows.push_back(aligned_row);
-                        }
+                        tbl->sample_rows.push_back(aligned_row);
+                        tbl->total_rows = tbl->sample_rows.size();
                         if (ret_p != std::string::npos) {
                             inserted_rows.push_back(std::move(aligned_row));
                         }
@@ -899,10 +1187,8 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
             }
 
             if (!conflict_found) {
-                tbl->total_rows++;
-                if (tbl->sample_rows.size() < 5000) {
-                    tbl->sample_rows.push_back(aligned_row);
-                }
+                tbl->sample_rows.push_back(aligned_row);
+                tbl->total_rows = tbl->sample_rows.size();
                 affected++;
                 if (ret_p != std::string::npos) {
                     returning_rows.push_back(aligned_row);

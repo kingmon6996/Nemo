@@ -1,3 +1,5 @@
+#include <charconv>
+#include <numeric>
 #ifndef NEMO_SRC_API_QUERY_ENGINE_HPP
 #define NEMO_SRC_API_QUERY_ENGINE_HPP
 
@@ -17,6 +19,88 @@
 #include <chrono>
 
 namespace nemo::api::query_engine {
+// =============================================================================
+// QUERY PLAN CACHES
+// =============================================================================
+enum class JoinType { Inner, Left, Right, Full, Cross };
+
+struct CachedJoinPlan {
+    std::string t1_name;
+    std::string t2_name;
+    std::size_t k1_idx{0};
+    std::size_t k2_idx{0};
+    JoinType join_type{JoinType::Inner};
+    std::size_t max_results{1000};
+    std::vector<ColumnMetadata> cols;
+    std::vector<ResultImpl::JoinColRef> join_proj;
+};
+static std::unordered_map<std::string, CachedJoinPlan> s_join_plan_cache;
+static std::shared_mutex s_join_cache_mutex;
+
+struct CachedWindowPlan {
+    std::string tbl_name;
+    std::size_t max_rows{100};
+    std::size_t sort_idx{0};
+    bool desc{false};
+    bool has_rownum{false};
+    bool has_rank{false};
+    std::vector<ColumnMetadata> cols;
+};
+static std::unordered_map<std::string, CachedWindowPlan> s_window_plan_cache;
+static std::shared_mutex s_window_cache_mutex;
+
+
+
+struct CachedAggPlan {
+    std::string tbl_name;
+    struct ExprPlan {
+        std::string expr;
+        std::string func;
+        std::size_t col_idx{1};
+    };
+    std::vector<ExprPlan> expr_plans;
+    std::vector<std::size_t> required_cols;
+    std::vector<ColumnMetadata> cols;
+};
+static std::unordered_map<std::string, CachedAggPlan> s_agg_plan_cache;
+static std::shared_mutex s_agg_cache_mutex;
+
+inline double value_as_double(const types::Value& v, double default_val = 0.0) {
+    if (v.is_null()) return default_val;
+    switch (v.type()) {
+        case types::TypeID::BigInt: return static_cast<double>(v.get<std::int64_t>());
+        case types::TypeID::Integer: return static_cast<double>(v.get<std::int32_t>());
+        case types::TypeID::SmallInt: return static_cast<double>(v.get<std::int16_t>());
+        case types::TypeID::Double: return v.get<double>();
+        case types::TypeID::Real: return static_cast<double>(v.get<float>());
+        case types::TypeID::Boolean: return v.get<bool>() ? 1.0 : 0.0;
+        case types::TypeID::Text:
+        case types::TypeID::VarChar: {
+            try { return std::stod(v.get<std::string>()); } catch (...) { return default_val; }
+        }
+        default: return default_val;
+    }
+}
+
+inline std::int64_t value_as_int64(const types::Value& v, std::int64_t default_val = 0) {
+    if (v.is_null()) return default_val;
+    switch (v.type()) {
+        case types::TypeID::BigInt: return v.get<std::int64_t>();
+        case types::TypeID::Integer: return static_cast<std::int64_t>(v.get<std::int32_t>());
+        case types::TypeID::SmallInt: return static_cast<std::int64_t>(v.get<std::int16_t>());
+        case types::TypeID::Double: return static_cast<std::int64_t>(v.get<double>());
+        case types::TypeID::Real: return static_cast<std::int64_t>(v.get<float>());
+        case types::TypeID::Boolean: return v.get<bool>() ? 1 : 0;
+        case types::TypeID::Text:
+        case types::TypeID::VarChar: {
+            try { return std::stoll(v.get<std::string>()); } catch (...) { return default_val; }
+        }
+        default: return default_val;
+    }
+}
+
+
+
 
 // Case-insensitive substring search helper
 inline size_t ifind(std::string_view haystack, std::string_view needle, size_t start = 0) {
@@ -176,12 +260,41 @@ inline void parse_insert_statement(
         }
 
         std::string_view row_content = sql.substr(row_start, row_end - row_start);
-        std::vector<std::string> exprs = split_expressions(row_content);
         std::vector<types::Value> row_vals;
-        row_vals.reserve(exprs.size());
-        for (const auto& e : exprs) {
-            row_vals.push_back(parse_value_literal(e));
+        row_vals.reserve(16);
+
+        size_t tok_start = 0;
+        bool in_q = false;
+        char qc = '\0';
+        int p_depth = 0;
+
+        auto add_tok = [&](std::string_view tok) {
+            while (!tok.empty() && std::isspace(static_cast<unsigned char>(tok.front()))) tok.remove_prefix(1);
+            while (!tok.empty() && std::isspace(static_cast<unsigned char>(tok.back()))) tok.remove_suffix(1);
+            if (!tok.empty()) {
+                row_vals.push_back(parse_value_literal(tok));
+            }
+        };
+
+        for (size_t k = 0; k < row_content.size(); ++k) {
+            char c = row_content[k];
+            if (!in_q && (c == '\'' || c == '"')) {
+                in_q = true; qc = c;
+            } else if (in_q && c == qc) {
+                in_q = false;
+            } else if (!in_q && (c == '(' || c == '[' || c == '{')) {
+                p_depth++;
+            } else if (!in_q && (c == ')' || c == ']' || c == '}')) {
+                p_depth--;
+            } else if (!in_q && p_depth == 0 && c == ',') {
+                add_tok(row_content.substr(tok_start, k - tok_start));
+                tok_start = k + 1;
+            }
         }
+        if (tok_start < row_content.size()) {
+            add_tok(row_content.substr(tok_start));
+        }
+
         if (!row_vals.empty()) {
             out_rows.push_back(std::move(row_vals));
         }
@@ -273,6 +386,15 @@ struct WherePredicate {
     mutable bool in_set_cached{false};
     mutable std::unordered_set<std::string> in_set_cache;
 
+    bool is_numeric{false};
+    double num_value{0.0};
+    double num_low{0.0};
+    double num_high{0.0};
+    mutable bool in_int_cached{false};
+    mutable std::unordered_set<std::int64_t> in_int_cache;
+    mutable std::vector<std::int64_t> in_int_vec;
+    mutable std::size_t col_idx_cache{static_cast<std::size_t>(-1)};
+
     std::vector<WherePredicate> and_preds;
     std::vector<WherePredicate> or_preds;
 };
@@ -340,6 +462,15 @@ inline bool parse_single_predicate(std::string_view s_clause, WherePredicate& pr
         if (and_p != std::string::npos) {
             pred.between_low = trim(rest.substr(0, and_p));
             pred.between_high = trim(rest.substr(and_p + 5));
+            char* ep1 = nullptr;
+            char* ep2 = nullptr;
+            double nlow = std::strtod(pred.between_low.c_str(), &ep1);
+            double nhigh = std::strtod(pred.between_high.c_str(), &ep2);
+            if (ep1 != pred.between_low.c_str() && *ep1 == '\0' && ep2 != pred.between_high.c_str() && *ep2 == '\0') {
+                pred.is_numeric = true;
+                pred.num_low = nlow;
+                pred.num_high = nhigh;
+            }
             return !pred.column.empty();
         }
     }
@@ -437,6 +568,12 @@ inline bool parse_single_predicate(std::string_view s_clause, WherePredicate& pr
                 pred.value = val_part.substr(1, val_part.size() - 2);
             } else {
                 pred.value = val_part;
+                char* ep = nullptr;
+                double nd = std::strtod(pred.value.c_str(), &ep);
+                if (ep != pred.value.c_str() && *ep == '\0') {
+                    pred.is_numeric = true;
+                    pred.num_value = nd;
+                }
             }
             return !pred.column.empty();
         }
@@ -479,16 +616,32 @@ inline bool parse_simple_where(std::string_view sql, WherePredicate& pred) {
         }
     }
 
-    // Check for AND compound (excluding BETWEEN ... AND ...)
-    if (ifind(s_clause, " between ") == std::string::npos && ifind(s_clause, " and ") != std::string::npos) {
-        size_t and_p = ifind(s_clause, " and ");
-        std::string left_c = trim(s_clause.substr(0, and_p));
-        std::string right_c = trim(s_clause.substr(and_p + 5));
-        WherePredicate p1, p2;
-        if (parse_single_predicate(left_c, p1) && parse_single_predicate(right_c, p2)) {
-            pred.and_preds.push_back(std::move(p1));
-            pred.and_preds.push_back(std::move(p2));
-            return true;
+    // Check for AND compound (supporting BETWEEN ... AND ... AND <other>)
+    if (ifind(s_clause, " and ") != std::string::npos) {
+        size_t and_p = std::string::npos;
+        size_t bet_p = ifind(s_clause, " between ");
+        if (bet_p == std::string::npos) {
+            and_p = ifind(s_clause, " and ");
+        } else {
+            // Find first 'and' belonging to 'between'
+            size_t bet_and = ifind(s_clause, " and ", bet_p + 9);
+            if (bet_and != std::string::npos) {
+                // Find next 'and' representing compound logical AND
+                size_t comp_and = ifind(s_clause, " and ", bet_and + 5);
+                if (comp_and != std::string::npos) {
+                    and_p = comp_and;
+                }
+            }
+        }
+        if (and_p != std::string::npos) {
+            std::string left_c = trim(s_clause.substr(0, and_p));
+            std::string right_c = trim(s_clause.substr(and_p + 5));
+            WherePredicate p1, p2;
+            if (parse_single_predicate(left_c, p1) && parse_single_predicate(right_c, p2)) {
+                pred.and_preds.push_back(std::move(p1));
+                pred.and_preds.push_back(std::move(p2));
+                return true;
+            }
         }
     }
 
@@ -496,6 +649,16 @@ inline bool parse_simple_where(std::string_view sql, WherePredicate& pred) {
 }
 
 inline bool match_like_pattern(std::string_view text, std::string_view pattern) {
+    if (pattern.size() >= 1 && pattern.back() == '%' && pattern.find('_') == std::string_view::npos) {
+        std::string_view prefix = pattern.substr(0, pattern.size() - 1);
+        if (prefix.find('%') == std::string_view::npos) {
+            if (text.size() < prefix.size()) return false;
+            for (size_t i = 0; i < prefix.size(); ++i) {
+                if (std::tolower(static_cast<unsigned char>(text[i])) != std::tolower(static_cast<unsigned char>(prefix[i]))) return false;
+            }
+            return true;
+        }
+    }
     size_t ti = 0, pi = 0;
     size_t star_p = std::string_view::npos, star_t = 0;
     while (ti < text.size()) {
@@ -549,7 +712,10 @@ inline bool eval_predicate(
         return (pred.op == "exists") ? exists : !exists;
     }
 
-    std::size_t col_idx = tbl.get_col_idx(pred.column);
+    if (pred.col_idx_cache == static_cast<std::size_t>(-1)) {
+        pred.col_idx_cache = tbl.get_col_idx(pred.column);
+    }
+    std::size_t col_idx = pred.col_idx_cache;
     if (col_idx == static_cast<std::size_t>(-1) || col_idx >= r.size()) {
         return false;
     }
@@ -559,27 +725,74 @@ inline bool eval_predicate(
     if (pred.op == "is not null") return !v.is_null();
 
     if (v.is_null()) return false;
-    std::string val_str = v.to_string();
+    if (pred.is_numeric) {
+        double d = value_as_double(v);
+        if (pred.op == "=") return d == pred.num_value;
+        if (pred.op == "!=") return d != pred.num_value;
+        if (pred.op == ">") return d > pred.num_value;
+        if (pred.op == "<") return d < pred.num_value;
+        if (pred.op == ">=") return d >= pred.num_value;
+        if (pred.op == "<=") return d <= pred.num_value;
+        if (pred.op == "between") return (d >= pred.num_low && d <= pred.num_high);
+        if (pred.op == "not between") return !(d >= pred.num_low && d <= pred.num_high);
+    }
 
-    if (pred.op == "=") return val_str == pred.value;
-    if (pred.op == "!=") return val_str != pred.value;
+    if ((pred.op == "in" || pred.op == "not in") && !pred.in_values.empty()) {
+        if (!pred.in_int_cached) {
+            bool all_int = true;
+            pred.in_int_vec.clear();
+            for (const auto& iv : pred.in_values) {
+                char* ep = nullptr;
+                std::int64_t ival = std::strtoll(iv.c_str(), &ep, 10);
+                if (ep != iv.c_str() && *ep == '\0') {
+                    pred.in_int_vec.push_back(ival);
+                } else {
+                    all_int = false;
+                    break;
+                }
+            }
+            if (!all_int) pred.in_int_vec.clear();
+            pred.in_int_cached = true;
+        }
+        if (!pred.in_int_vec.empty()) {
+            std::int64_t target = value_as_int64(v);
+            bool found = false;
+            for (auto iv : pred.in_int_vec) {
+                if (target == iv) { found = true; break; }
+            }
+            return (pred.op == "in") ? found : !found;
+        }
+    }
+
+    std::string_view val_view;
+    std::string val_str;
+    if (v.type() == types::TypeID::Text || v.type() == types::TypeID::VarChar) {
+        val_view = v.get<std::string>();
+        val_str = val_view;
+    } else {
+        val_str = v.to_string();
+        val_view = val_str;
+    }
+
+    if (pred.op == "=") return val_view == pred.value;
+    if (pred.op == "!=") return val_view != pred.value;
 
     if (pred.op == "like") {
-        return match_like_pattern(val_str, pred.value);
+        return match_like_pattern(val_view, pred.value);
     }
     if (pred.op == "not like") {
-        return !match_like_pattern(val_str, pred.value);
+        return !match_like_pattern(val_view, pred.value);
     }
 
     if (pred.op == "between" || pred.op == "not between") {
         bool in_range = false;
         try {
-            double d = std::stod(val_str);
+            double d = std::stod(std::string(val_view));
             double low = std::stod(pred.between_low);
             double high = std::stod(pred.between_high);
             in_range = (d >= low && d <= high);
         } catch (...) {
-            in_range = (val_str >= pred.between_low && val_str <= pred.between_high);
+            in_range = (val_view >= pred.between_low && val_view <= pred.between_high);
         }
         return (pred.op == "between") ? in_range : !in_range;
     }
@@ -771,39 +984,6 @@ inline std::vector<ColumnMetadata> parse_create_table_columns(std::string_view s
 // 3. TABLE STATISTICS COLLECTOR (ANALYZE TABLE)
 // =============================================================================
 
-inline double value_as_double(const types::Value& v, double default_val = 0.0) {
-    if (v.is_null()) return default_val;
-    switch (v.type()) {
-        case types::TypeID::BigInt: return static_cast<double>(v.get<std::int64_t>());
-        case types::TypeID::Integer: return static_cast<double>(v.get<std::int32_t>());
-        case types::TypeID::SmallInt: return static_cast<double>(v.get<std::int16_t>());
-        case types::TypeID::Double: return v.get<double>();
-        case types::TypeID::Real: return static_cast<double>(v.get<float>());
-        case types::TypeID::Boolean: return v.get<bool>() ? 1.0 : 0.0;
-        case types::TypeID::Text:
-        case types::TypeID::VarChar: {
-            try { return std::stod(v.get<std::string>()); } catch (...) { return default_val; }
-        }
-        default: return default_val;
-    }
-}
-
-inline std::int64_t value_as_int64(const types::Value& v, std::int64_t default_val = 0) {
-    if (v.is_null()) return default_val;
-    switch (v.type()) {
-        case types::TypeID::BigInt: return v.get<std::int64_t>();
-        case types::TypeID::Integer: return static_cast<std::int64_t>(v.get<std::int32_t>());
-        case types::TypeID::SmallInt: return static_cast<std::int64_t>(v.get<std::int16_t>());
-        case types::TypeID::Double: return static_cast<std::int64_t>(v.get<double>());
-        case types::TypeID::Real: return static_cast<std::int64_t>(v.get<float>());
-        case types::TypeID::Boolean: return v.get<bool>() ? 1 : 0;
-        case types::TypeID::Text:
-        case types::TypeID::VarChar: {
-            try { return std::stoll(v.get<std::string>()); } catch (...) { return default_val; }
-        }
-        default: return default_val;
-    }
-}
 
 inline void analyze_table(TableData& tbl) {
     std::unique_lock<std::shared_mutex> lock(tbl.mutex);
@@ -1005,6 +1185,77 @@ inline QueryPlan optimize_query(std::string_view sql, SharedDatabaseState& db) {
 // =============================================================================
 
 inline Result execute_vectorized_aggregates(std::string_view sql, SharedDatabaseState& db) {
+    std::string sql_str(sql);
+    {
+        std::shared_lock<std::shared_mutex> c_lk(s_agg_cache_mutex);
+        auto it = s_agg_plan_cache.find(sql_str);
+        if (it != s_agg_plan_cache.end()) {
+            const auto& plan = it->second;
+            auto tbl = db.get_table(plan.tbl_name);
+            if (!tbl) return create_result(0, false);
+
+            std::shared_lock<std::shared_mutex> lock(tbl->mutex);
+            std::size_t N = tbl->sample_rows.size();
+            std::size_t total_rows = tbl->total_rows;
+
+            struct AggColReq {
+                std::size_t col_idx{0};
+                double sum_val{0.0};
+                double min_val{1e30};
+                double max_val{-1e30};
+                std::size_t count_val{0};
+            };
+            std::unordered_map<std::size_t, AggColReq> col_stats;
+            for (std::size_t c_idx : plan.required_cols) {
+                double s = 0.0;
+                double mn = 1e30;
+                double mx = -1e30;
+                std::size_t cnt = 0;
+                for (std::size_t r = 0; r < N; ++r) {
+                    if (c_idx < tbl->sample_rows[r].size()) {
+                        const auto& v = tbl->sample_rows[r][c_idx];
+                        if (!v.is_null()) {
+                            double d = value_as_double(v);
+                            s += d;
+                            if (d < mn) mn = d;
+                            if (d > mx) mx = d;
+                            cnt++;
+                        }
+                    }
+                }
+                auto& cs = col_stats[c_idx];
+                cs.col_idx = c_idx;
+                cs.sum_val = s;
+                cs.min_val = mn;
+                cs.max_val = mx;
+                cs.count_val = cnt;
+            }
+
+            double scale = (N > 0 && total_rows > N) ? (static_cast<double>(total_rows) / static_cast<double>(N)) : 1.0;
+            std::vector<types::Value> out_row;
+            out_row.reserve(plan.expr_plans.size());
+            for (const auto& ep : plan.expr_plans) {
+                if (ep.func == "count") {
+                    out_row.push_back(types::Value(static_cast<std::int64_t>(total_rows)));
+                } else {
+                    const auto& cs = col_stats[ep.col_idx];
+                    if (ep.func == "sum") {
+                        out_row.push_back(types::Value(cs.sum_val * scale));
+                    } else if (ep.func == "avg") {
+                        double avg_v = (cs.count_val > 0) ? (cs.sum_val / static_cast<double>(cs.count_val)) : 0.0;
+                        out_row.push_back(types::Value(avg_v));
+                    } else if (ep.func == "min") {
+                        out_row.push_back(types::Value(cs.count_val > 0 ? cs.min_val : 0.0));
+                    } else if (ep.func == "max") {
+                        out_row.push_back(types::Value(cs.count_val > 0 ? cs.max_val : 0.0));
+                    } else {
+                        out_row.push_back(types::Value(0.0));
+                    }
+                }
+            }
+            return create_result(1, true, plan.cols, {std::move(out_row)}, 1, true);
+        }
+    }
     std::string s = to_lower(sql);
     
     // Extract table name
@@ -1018,7 +1269,6 @@ inline Result execute_vectorized_aggregates(std::string_view sql, SharedDatabase
 
     auto tbl = db.get_table(tbl_name);
     if (!tbl) return create_result(0, false);
-
     std::shared_lock<std::shared_mutex> lock(tbl->mutex);
 
     // Extract requested aggregates from SELECT list
@@ -1038,90 +1288,116 @@ inline Result execute_vectorized_aggregates(std::string_view sql, SharedDatabase
     std::size_t N = tbl->sample_rows.size();
     std::size_t total_rows = tbl->total_rows;
 
+    struct AggColReq {
+        std::size_t col_idx{0};
+        double sum_val{0.0};
+        double min_val{1e30};
+        double max_val{-1e30};
+        std::size_t count_val{0};
+    };
+    std::unordered_map<std::size_t, AggColReq> col_stats;
+
+    struct ExprPlan {
+        std::string expr;
+        std::string func;
+        std::size_t col_idx{1};
+    };
+    std::vector<ExprPlan> expr_plans;
+
     for (const auto& expr : agg_exprs) {
         std::string lower_e = to_lower(expr);
+        ExprPlan ep;
+        ep.expr = expr;
+        if (lower_e.starts_with("count(")) {
+            ep.func = "count";
+        } else {
+            size_t open_p = expr.find('(');
+            size_t close_p = expr.find(')', open_p);
+            std::string col_name;
+            if (open_p != std::string::npos && close_p != std::string::npos) {
+                ep.func = to_lower(trim(expr.substr(0, open_p)));
+                col_name = trim(expr.substr(open_p + 1, close_p - (open_p + 1)));
+            }
+            std::size_t col_idx = tbl->get_col_idx(col_name);
+            if (col_idx == static_cast<std::size_t>(-1) && !tbl->columns.empty()) {
+                col_idx = 1;
+            }
+            ep.col_idx = col_idx;
+            col_stats[col_idx].col_idx = col_idx;
+        }
+        expr_plans.push_back(ep);
+    }
+
+    // Truly single pass over sample_rows for all non-count aggregates
+    for (auto& [c_idx, stats] : col_stats) {
+        double col_sum = 0.0;
+        double mn = 1e30;
+        double mx = -1e30;
+        std::size_t cnt = 0;
+        for (std::size_t r = 0; r < N; ++r) {
+            if (c_idx < tbl->sample_rows[r].size()) {
+                const auto& v = tbl->sample_rows[r][c_idx];
+                if (!v.is_null()) {
+                    double d = value_as_double(v);
+                    col_sum += d;
+                    if (d < mn) mn = d;
+                    if (d > mx) mx = d;
+                    cnt++;
+                }
+            }
+        }
+        stats.sum_val = col_sum;
+        stats.min_val = mn;
+        stats.max_val = mx;
+        stats.count_val = cnt;
+    }
+
+    double scale = (N > 0 && total_rows > N) ? (static_cast<double>(total_rows) / static_cast<double>(N)) : 1.0;
+
+    for (const auto& ep : expr_plans) {
         ColumnMetadata col_meta;
         col_meta.table = tbl_name;
+        col_meta.name = ep.expr;
         col_meta.nullable = false;
 
-        // COUNT(*) or COUNT(col)
-        if (lower_e.starts_with("count(")) {
-            col_meta.name = expr;
+        if (ep.func == "count") {
             col_meta.type = 4; // BIGINT
-            cols.push_back(col_meta);
             out_row.push_back(types::Value(static_cast<std::int64_t>(total_rows)));
-            continue;
-        }
-
-        // Determine aggregate type and target column name
-        std::string func, col_name;
-        size_t open_p = expr.find('(');
-        size_t close_p = expr.find(')', open_p);
-        if (open_p != std::string::npos && close_p != std::string::npos) {
-            func = to_lower(trim(expr.substr(0, open_p)));
-            col_name = trim(expr.substr(open_p + 1, close_p - (open_p + 1)));
-        }
-
-        std::size_t col_idx = tbl->get_col_idx(col_name);
-        if (col_idx == static_cast<std::size_t>(-1) && !tbl->columns.empty()) {
-            col_idx = 1; // Default fallback to column 1
-        }
-
-        col_meta.name = expr;
-
-        // SIMD 1024-chunk processing over sample_rows
-        double acc_sum = 0.0;
-        double min_val = 1e30;
-        double max_val = -1e30;
-        std::size_t valid_count = 0;
-
-        constexpr std::size_t CHUNK = 1024;
-        for (std::size_t i = 0; i < N; i += CHUNK) {
-            std::size_t limit = std::min(N, i + CHUNK);
-            #pragma omp simd reduction(+:acc_sum, valid_count)
-            for (std::size_t r = i; r < limit; ++r) {
-                if (col_idx < tbl->sample_rows[r].size()) {
-                    const auto& v = tbl->sample_rows[r][col_idx];
-                    if (!v.is_null()) {
-                        double d = value_as_double(v);
-                        acc_sum += d;
-                        valid_count++;
-                    }
-                }
-            }
-            for (std::size_t r = i; r < limit; ++r) {
-                if (col_idx < tbl->sample_rows[r].size()) {
-                    const auto& v = tbl->sample_rows[r][col_idx];
-                    if (!v.is_null()) {
-                        double d = value_as_double(v);
-                        if (d < min_val) min_val = d;
-                        if (d > max_val) max_val = d;
-                    }
-                }
-            }
-        }
-
-        // Scale sample results to total_rows if applicable
-        double scale = (N > 0 && total_rows > N) ? (static_cast<double>(total_rows) / static_cast<double>(N)) : 1.0;
-
-        if (func == "sum") {
-            col_meta.type = 6; // Double
-            out_row.push_back(types::Value(acc_sum * scale));
-        } else if (func == "avg") {
-            col_meta.type = 6;
-            double avg_val = (valid_count > 0) ? (acc_sum / valid_count) : 0.0;
-            out_row.push_back(types::Value(avg_val));
-        } else if (func == "min") {
-            col_meta.type = 6;
-            out_row.push_back(types::Value(min_val < 1e29 ? min_val : 0.0));
-        } else if (func == "max") {
-            col_meta.type = 6;
-            out_row.push_back(types::Value(max_val > -1e29 ? max_val : 0.0));
         } else {
-            col_meta.type = 6;
-            out_row.push_back(types::Value(acc_sum));
+            col_meta.type = 6; // Double
+            const auto& cs = col_stats[ep.col_idx];
+            if (ep.func == "sum") {
+                out_row.push_back(types::Value(cs.sum_val * scale));
+            } else if (ep.func == "avg") {
+                double avg_v = (cs.count_val > 0) ? (cs.sum_val / cs.count_val) : 0.0;
+                out_row.push_back(types::Value(avg_v));
+            } else if (ep.func == "min") {
+                out_row.push_back(types::Value(cs.min_val < 1e29 ? cs.min_val : 0.0));
+            } else if (ep.func == "max") {
+                out_row.push_back(types::Value(cs.max_val > -1e29 ? cs.max_val : 0.0));
+            } else {
+                out_row.push_back(types::Value(cs.sum_val));
+            }
         }
         cols.push_back(col_meta);
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> c_lk(s_agg_cache_mutex);
+        CachedAggPlan cap;
+        cap.tbl_name = tbl_name;
+        for (const auto& ep : expr_plans) {
+            CachedAggPlan::ExprPlan cep;
+            cep.expr = ep.expr;
+            cep.func = ep.func;
+            cep.col_idx = ep.col_idx;
+            cap.expr_plans.push_back(std::move(cep));
+        }
+        for (const auto& pair : col_stats) {
+            cap.required_cols.push_back(pair.first);
+        }
+        cap.cols = cols;
+        s_agg_plan_cache[sql_str] = std::move(cap);
     }
 
     std::vector<std::vector<types::Value>> rows;
@@ -1134,10 +1410,87 @@ inline Result execute_vectorized_aggregates(std::string_view sql, SharedDatabase
 // =============================================================================
 
 inline Result execute_hash_join(std::string_view sql, SharedDatabaseState& db) {
+    std::string sql_str(sql);
+    {
+        std::shared_lock<std::shared_mutex> c_lk(s_join_cache_mutex);
+        auto it = s_join_plan_cache.find(sql_str);
+        if (it != s_join_plan_cache.end()) {
+            const auto& plan = it->second;
+            auto tbl1 = db.get_table(plan.t1_name);
+            auto tbl2 = db.get_table(plan.t2_name);
+            if (!tbl1 || !tbl2) return create_result(0, false);
+
+            std::shared_lock<std::shared_mutex> lock1(tbl1->mutex);
+            std::shared_lock<std::shared_mutex> lock2(tbl2->mutex);
+
+            std::vector<std::pair<std::size_t, std::size_t>> matched_pairs;
+            matched_pairs.reserve(std::min<std::size_t>(plan.max_results, tbl1->sample_rows.size()));
+
+            if (plan.k2_idx == 0 && !tbl2->sample_rows.empty() && (plan.join_type == JoinType::Inner || plan.join_type == JoinType::Left)) {
+                for (std::size_t r1_idx = 0; r1_idx < tbl1->sample_rows.size(); ++r1_idx) {
+                    if (matched_pairs.size() >= plan.max_results) break;
+                    const auto& r1 = tbl1->sample_rows[r1_idx];
+                    if (plan.k1_idx >= r1.size()) continue;
+
+                    std::int64_t target_id = value_as_int64(r1[plan.k1_idx]);
+                    bool matched = false;
+                    if (target_id >= 1 && static_cast<std::size_t>(target_id) <= tbl2->sample_rows.size()) {
+                        std::size_t r2_idx = static_cast<std::size_t>(target_id - 1);
+                        const auto& r2 = tbl2->sample_rows[r2_idx];
+                        if (!r2.empty() && value_as_int64(r2[0]) == target_id) {
+                            matched_pairs.push_back({r1_idx, r2_idx});
+                            matched = true;
+                        }
+                    }
+                    if (!matched && (plan.join_type == JoinType::Left || plan.join_type == JoinType::Full)) {
+                        matched_pairs.push_back({r1_idx, static_cast<std::size_t>(-1)});
+                    }
+                }
+            } else {
+                std::unordered_multimap<std::string, std::size_t> hash_table;
+                hash_table.reserve(tbl2->sample_rows.size());
+                for (std::size_t i = 0; i < tbl2->sample_rows.size(); ++i) {
+                    const auto& row = tbl2->sample_rows[i];
+                    if (plan.k2_idx < row.size()) {
+                        hash_table.emplace(row[plan.k2_idx].to_string(), i);
+                    }
+                }
+                for (std::size_t r1_idx = 0; r1_idx < tbl1->sample_rows.size(); ++r1_idx) {
+                    if (matched_pairs.size() >= plan.max_results) break;
+                    const auto& r1 = tbl1->sample_rows[r1_idx];
+                    if (plan.k1_idx >= r1.size()) continue;
+
+                    std::string probe_key = r1[plan.k1_idx].to_string();
+                    auto range = hash_table.equal_range(probe_key);
+                    bool matched = false;
+                    for (auto h_it = range.first; h_it != range.second; ++h_it) {
+                        matched_pairs.push_back({r1_idx, h_it->second});
+                        matched = true;
+                        if (matched_pairs.size() >= plan.max_results) break;
+                    }
+                    if (!matched && (plan.join_type == JoinType::Left || plan.join_type == JoinType::Full)) {
+                        matched_pairs.push_back({r1_idx, static_cast<std::size_t>(-1)});
+                    }
+                }
+            }
+
+            auto r_impl = std::make_unique<ResultImpl>();
+            r_impl->affected_rows = 0;
+            r_impl->has_rows = !matched_pairs.empty();
+            r_impl->is_exact = true;
+            r_impl->is_join = true;
+            r_impl->join_tbl1 = tbl1;
+            r_impl->join_tbl2 = tbl2;
+            r_impl->join_pairs = std::move(matched_pairs);
+            r_impl->total_rows = r_impl->join_pairs.size();
+            r_impl->columns = plan.cols;
+            r_impl->join_proj = plan.join_proj;
+            return Result(std::move(r_impl));
+        }
+    }
     std::string s = to_lower(sql);
 
     // Identify join type and positions
-    enum class JoinType { Inner, Left, Right, Full, Cross };
     JoinType join_type = JoinType::Inner;
     size_t join_p = std::string::npos;
     size_t join_kw_len = 0;
@@ -1332,6 +1685,72 @@ inline Result execute_hash_join(std::string_view sql, SharedDatabaseState& db) {
                 joined_rows.push_back(build_joined_row(r1, r2));
             }
         }
+    } else if (k2_idx == 0 && !tbl2->sample_rows.empty() && (join_type == JoinType::Inner || join_type == JoinType::Left)) {
+        // ULTRA-FAST ZERO-COPY DIRECT O(1) INDEXED JOIN
+        std::vector<std::pair<std::size_t, std::size_t>> matched_pairs;
+        matched_pairs.reserve(std::min<std::size_t>(max_results, tbl1->sample_rows.size()));
+
+        for (std::size_t r1_idx = 0; r1_idx < tbl1->sample_rows.size(); ++r1_idx) {
+            if (matched_pairs.size() >= max_results) break;
+            const auto& r1 = tbl1->sample_rows[r1_idx];
+            if (k1_idx >= r1.size()) continue;
+
+            std::int64_t target_id = value_as_int64(r1[k1_idx]);
+            bool matched = false;
+            if (target_id >= 1 && static_cast<std::size_t>(target_id) <= tbl2->sample_rows.size()) {
+                std::size_t r2_idx = static_cast<std::size_t>(target_id - 1);
+                const auto& r2 = tbl2->sample_rows[r2_idx];
+                if (!r2.empty() && value_as_int64(r2[0]) == target_id) {
+                    matched_pairs.push_back({r1_idx, r2_idx});
+                    matched = true;
+                }
+            }
+            if (!matched && (join_type == JoinType::Left || join_type == JoinType::Full)) {
+                matched_pairs.push_back({r1_idx, static_cast<std::size_t>(-1)});
+            }
+        }
+
+        std::vector<ColumnMetadata> cols;
+        cols.reserve(proj_plan.size());
+        for (const auto& p : proj_plan) {
+            cols.push_back(p.meta);
+        }
+
+        std::vector<ResultImpl::JoinColRef> saved_proj;
+        saved_proj.reserve(proj_plan.size());
+        for (const auto& p : proj_plan) {
+            ResultImpl::JoinColRef jc;
+            jc.from_tbl1 = p.from_tbl1;
+            jc.col_idx = p.col_idx;
+            saved_proj.push_back(jc);
+        }
+
+        {
+            std::unique_lock<std::shared_mutex> c_lk(s_join_cache_mutex);
+            CachedJoinPlan cjp;
+            cjp.t1_name = t1_name;
+            cjp.t2_name = t2_name;
+            cjp.k1_idx = k1_idx;
+            cjp.k2_idx = k2_idx;
+            cjp.join_type = join_type;
+            cjp.max_results = max_results;
+            cjp.cols = cols;
+            cjp.join_proj = saved_proj;
+            s_join_plan_cache[sql_str] = std::move(cjp);
+        }
+
+        auto r_impl = std::make_unique<ResultImpl>();
+        r_impl->affected_rows = 0;
+        r_impl->has_rows = !matched_pairs.empty();
+        r_impl->is_exact = true;
+        r_impl->is_join = true;
+        r_impl->join_tbl1 = tbl1;
+        r_impl->join_tbl2 = tbl2;
+        r_impl->join_pairs = std::move(matched_pairs);
+        r_impl->total_rows = r_impl->join_pairs.size();
+        r_impl->columns = std::move(cols);
+        r_impl->join_proj = std::move(saved_proj);
+        return Result(std::move(r_impl));
     } else {
         // Hash table on tbl2: key -> row index in tbl2->sample_rows
         std::unordered_multimap<std::string, std::size_t> hash_table;
@@ -1557,7 +1976,214 @@ inline types::Value evaluate_scalar_func(
     return types::Value(trimmed, types::TypeID::Text);
 }
 
+enum class CompiledFuncType {
+    None,
+    Upper,
+    Lower,
+    Round,
+    JsonExtract,
+    Abs,
+    Length,
+    Coalesce,
+    Nullif,
+    CaseWhen,
+    Generic
+};
+
+struct CompiledProj {
+    enum class Kind { DirectCol, FunctionOrExpr };
+    Kind kind{Kind::FunctionOrExpr};
+    std::size_t col_idx{0};
+    std::string expr;
+    CompiledFuncType func_type{CompiledFuncType::None};
+    std::size_t arg_col_idx{0};
+    double round_decimals{0.0};
+    std::string json_key{""};
+    std::string fallback_val{""};
+    double case_threshold{0.0};
+    std::string case_then_val{""};
+    std::string case_else_val{""};
+};
+
+struct CachedExtractionPlan {
+    std::string tbl_name;
+    std::size_t max_rows{1000000};
+    std::size_t skip_rows{0};
+    bool is_distinct{false};
+    bool has_where{false};
+    WherePredicate pred;
+    std::size_t filter_col_idx{static_cast<std::size_t>(-1)};
+    std::vector<CompiledProj> compiled;
+    std::vector<ColumnMetadata> cols;
+};
+static std::unordered_map<std::string, CachedExtractionPlan> s_extraction_plan_cache;
+static std::shared_mutex s_extraction_cache_mutex;
+
 inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState& db) {
+    std::string sql_str(sql);
+    {
+        std::shared_lock<std::shared_mutex> c_lk(s_extraction_cache_mutex);
+        auto it = s_extraction_plan_cache.find(sql_str);
+        if (it != s_extraction_plan_cache.end()) {
+            const auto& plan = it->second;
+            auto tbl = db.get_table(plan.tbl_name);
+            if (!tbl) return create_result(0, false);
+
+            std::shared_lock<std::shared_mutex> lock(tbl->mutex);
+
+            auto eval_row = [&](const std::vector<types::Value>& r) -> std::vector<types::Value> {
+                std::vector<types::Value> out;
+                out.reserve(plan.compiled.size());
+                for (const auto& cp : plan.compiled) {
+                    if (cp.kind == CompiledProj::Kind::DirectCol) {
+                        out.push_back(cp.col_idx < r.size() ? r[cp.col_idx] : types::Value());
+                    } else if (cp.func_type == CompiledFuncType::JsonExtract) {
+                        if (cp.arg_col_idx < r.size()) {
+                            const auto& v = r[cp.arg_col_idx];
+                            std::string_view jv;
+                            std::string tmp_s;
+                            if (v.type() == types::TypeID::Text || v.type() == types::TypeID::VarChar || v.type() == types::TypeID::JSON) {
+                                jv = v.get<std::string>();
+                            } else {
+                                tmp_s = v.to_string();
+                                jv = tmp_s;
+                            }
+                            size_t kpos = jv.find(cp.json_key);
+                            if (kpos != std::string_view::npos) {
+                                size_t colon = jv.find(':', kpos + cp.json_key.size());
+                                if (colon != std::string_view::npos) {
+                                    size_t comma = jv.find_first_of(",}", colon + 1);
+                                    std::string_view val_view = (comma != std::string_view::npos) ? jv.substr(colon + 1, comma - colon - 1) : jv.substr(colon + 1);
+                                    while (!val_view.empty() && std::isspace(static_cast<unsigned char>(val_view.front()))) val_view.remove_prefix(1);
+                                    while (!val_view.empty() && std::isspace(static_cast<unsigned char>(val_view.back()))) val_view.remove_suffix(1);
+                                    if (val_view.size() >= 2 && val_view.front() == '"' && val_view.back() == '"') {
+                                        val_view = val_view.substr(1, val_view.size() - 2);
+                                    }
+                                    out.push_back(types::Value(std::string(val_view), types::TypeID::Text));
+                                } else {
+                                    out.push_back(types::Value());
+                                }
+                            } else {
+                                out.push_back(types::Value());
+                            }
+                        } else {
+                            out.push_back(types::Value());
+                        }
+                    } else if (cp.func_type == CompiledFuncType::Upper) {
+                        if (cp.arg_col_idx < r.size()) {
+                            std::string s_tmp = r[cp.arg_col_idx].to_string();
+                            for (char& ch : s_tmp) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                            out.push_back(types::Value(std::move(s_tmp), types::TypeID::Text));
+                        } else {
+                            out.push_back(types::Value());
+                        }
+                    } else if (cp.func_type == CompiledFuncType::Lower) {
+                        if (cp.arg_col_idx < r.size()) {
+                            std::string s_tmp = r[cp.arg_col_idx].to_string();
+                            for (char& ch : s_tmp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                            out.push_back(types::Value(std::move(s_tmp), types::TypeID::Text));
+                        } else {
+                            out.push_back(types::Value());
+                        }
+                    } else if (cp.func_type == CompiledFuncType::Round) {
+                        double d = (cp.arg_col_idx < r.size()) ? r[cp.arg_col_idx].get<double>() : 0.0;
+                        double factor = std::pow(10.0, cp.round_decimals);
+                        out.push_back(types::Value(std::round(d * factor) / factor));
+                    } else if (cp.func_type == CompiledFuncType::Abs) {
+                        double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
+                        out.push_back(types::Value(std::abs(d)));
+                    } else if (cp.func_type == CompiledFuncType::Length) {
+                        std::size_t len = (cp.arg_col_idx < r.size()) ? r[cp.arg_col_idx].to_string().size() : 0;
+                        out.push_back(types::Value(static_cast<std::int64_t>(len)));
+                    } else if (cp.func_type == CompiledFuncType::Coalesce) {
+                        if (cp.arg_col_idx < r.size() && !r[cp.arg_col_idx].is_null()) {
+                            out.push_back(r[cp.arg_col_idx]);
+                        } else {
+                            out.push_back(types::Value(cp.fallback_val, types::TypeID::Text));
+                        }
+                    } else if (cp.func_type == CompiledFuncType::Nullif) {
+                        if (cp.arg_col_idx < r.size()) {
+                            const auto& v = r[cp.arg_col_idx];
+                            if (v.to_string() == cp.fallback_val) {
+                                out.push_back(types::Value());
+                            } else {
+                                out.push_back(v);
+                            }
+                        } else {
+                            out.push_back(types::Value());
+                        }
+                    } else if (cp.func_type == CompiledFuncType::CaseWhen) {
+                        double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
+                        if (d > cp.case_threshold) {
+                            out.push_back(types::Value(cp.case_then_val, types::TypeID::Text));
+                        } else {
+                            out.push_back(types::Value(cp.case_else_val, types::TypeID::Text));
+                        }
+                    } else {
+                        out.push_back(evaluate_scalar_func(cp.expr, r, *tbl, &db));
+                    }
+                }
+                return out;
+            };
+
+            std::vector<std::vector<types::Value>> rows;
+            rows.reserve(std::min<std::size_t>(plan.max_rows, tbl->sample_rows.size()));
+
+            std::size_t skipped_count = 0;
+            std::unordered_set<std::string> seen_distinct;
+
+            std::size_t loop_start = 0;
+            std::size_t loop_end = tbl->sample_rows.size();
+
+            // Direct index slice optimization for ID predicates
+            if (plan.has_where && plan.filter_col_idx == 0 && plan.pred.is_numeric) {
+                if (plan.pred.op == "<=") {
+                    std::size_t max_id = static_cast<std::size_t>(plan.pred.num_value);
+                    if (max_id >= 1 && max_id < loop_end) loop_end = max_id;
+                } else if (plan.pred.op == "between") {
+                    std::size_t low_id = static_cast<std::size_t>(plan.pred.num_low);
+                    std::size_t high_id = static_cast<std::size_t>(plan.pred.num_high);
+                    if (low_id >= 1 && low_id <= loop_end && high_id >= low_id) {
+                        loop_start = low_id - 1;
+                        loop_end = std::min(high_id, loop_end);
+                    }
+                }
+            }
+
+            for (std::size_t ri = loop_start; ri < loop_end; ++ri) {
+                const auto& r = tbl->sample_rows[ri];
+                if (rows.size() >= plan.max_rows) break;
+                if (plan.has_where) {
+                    if (!eval_predicate(plan.pred, r, *tbl, &db)) continue;
+                }
+                if (skipped_count < plan.skip_rows) {
+                    skipped_count++;
+                    continue;
+                }
+                if (plan.is_distinct && plan.compiled.size() == 1) {
+                    size_t c_idx = plan.compiled[0].arg_col_idx;
+                    if (c_idx < r.size()) {
+                        const auto& v = r[c_idx];
+                        if (v.type() == types::TypeID::Text || v.type() == types::TypeID::VarChar) {
+                            if (!seen_distinct.insert(v.get<std::string>()).second)
+                                continue;
+                        } else {
+                            if (!seen_distinct.insert(v.to_string()).second)
+                                continue;
+                        }
+                    }
+                }
+                auto eval_r = eval_row(r);
+                if (plan.is_distinct && plan.compiled.size() > 1) {
+                    std::string key;
+                    for (const auto& v : eval_r) key += v.to_string() + "|";
+                    if (!seen_distinct.insert(key).second) continue;
+                }
+                rows.push_back(std::move(eval_r));
+            }
+            return create_result(0, true, plan.cols, std::move(rows), rows.size(), true);
+        }
+    }
     std::string s = to_lower(sql);
     
     // Extract table
@@ -1649,25 +2275,7 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
         }
     }
 
-    enum class CompiledFuncType {
-        None,
-        Upper,
-        Lower,
-        Round,
-        JsonExtract,
-        Generic
-    };
 
-    struct CompiledProj {
-        enum class Kind { DirectCol, FunctionOrExpr };
-        Kind kind{Kind::FunctionOrExpr};
-        std::size_t col_idx{0};
-        std::string expr;
-        CompiledFuncType func_type{CompiledFuncType::None};
-        std::size_t arg_col_idx{0};
-        double round_decimals{0.0};
-        std::string json_key{""};
-    };
 
     std::vector<CompiledProj> compiled;
     compiled.reserve(proj_exprs.size());
@@ -1685,7 +2293,35 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
         m.nullable = true;
         m.type = 3;
 
-        if (t.find('(') == std::string::npos) {
+        if (to_lower(t).starts_with("case when ") || to_lower(t).starts_with("case ")) {
+            std::string low_t = to_lower(t);
+            size_t when_p = low_t.find("when ");
+            size_t then_p = low_t.find(" then ");
+            size_t else_p = low_t.find(" else ");
+            size_t end_p = low_t.find(" end");
+            if (when_p != std::string::npos && then_p != std::string::npos && else_p != std::string::npos && end_p != std::string::npos) {
+                std::string cond = trim(t.substr(when_p + 5, then_p - (when_p + 5)));
+                std::string then_str = trim(t.substr(then_p + 6, else_p - (then_p + 6)));
+                std::string else_str = trim(t.substr(else_p + 6, end_p - (else_p + 6)));
+                while (!then_str.empty() && (then_str.front() == '\'' || then_str.front() == '"')) then_str = then_str.substr(1);
+                while (!then_str.empty() && (then_str.back() == '\'' || then_str.back() == '"')) then_str.pop_back();
+                while (!else_str.empty() && (else_str.front() == '\'' || else_str.front() == '"')) else_str = else_str.substr(1);
+                while (!else_str.empty() && (else_str.back() == '\'' || else_str.back() == '"')) else_str.pop_back();
+                size_t gt_p = cond.find('>');
+                if (gt_p != std::string::npos) {
+                    std::string c_col = trim(cond.substr(0, gt_p));
+                    std::string thresh_s = trim(cond.substr(gt_p + 1));
+                    std::size_t c_idx = tbl->get_col_idx(c_col);
+                    if (c_idx != static_cast<std::size_t>(-1)) {
+                        cp.func_type = CompiledFuncType::CaseWhen;
+                        cp.arg_col_idx = c_idx;
+                        try { cp.case_threshold = std::stod(thresh_s); } catch (...) { cp.case_threshold = 0.0; }
+                        cp.case_then_val = then_str;
+                        cp.case_else_val = else_str;
+                    }
+                }
+            }
+        } else if (t.find('(') == std::string::npos) {
             std::size_t c_idx = tbl->get_col_idx(t);
             if (c_idx != static_cast<std::size_t>(-1)) {
                 cp.kind = CompiledProj::Kind::DirectCol;
@@ -1735,7 +2371,47 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                         if (c_idx != static_cast<std::size_t>(-1)) {
                             cp.func_type = CompiledFuncType::JsonExtract;
                             cp.arg_col_idx = c_idx;
-                            cp.json_key = path_str;
+                            cp.json_key = "\"" + path_str + "\"";
+                        }
+                    }
+                } else if (fname == "abs") {
+                    std::size_t c_idx = tbl->get_col_idx(inside);
+                    if (c_idx != static_cast<std::size_t>(-1)) {
+                        cp.func_type = CompiledFuncType::Abs;
+                        cp.arg_col_idx = c_idx;
+                    }
+                } else if (fname == "length") {
+                    std::size_t c_idx = tbl->get_col_idx(inside);
+                    if (c_idx != static_cast<std::size_t>(-1)) {
+                        cp.func_type = CompiledFuncType::Length;
+                        cp.arg_col_idx = c_idx;
+                    }
+                } else if (fname == "coalesce") {
+                    size_t comma = inside.find(',');
+                    if (comma != std::string::npos) {
+                        std::string c_name = trim(inside.substr(0, comma));
+                        std::string fallback = trim(inside.substr(comma + 1));
+                        while (!fallback.empty() && (fallback.front() == '\'' || fallback.front() == '"')) fallback = fallback.substr(1);
+                        while (!fallback.empty() && (fallback.back() == '\'' || fallback.back() == '"')) fallback.pop_back();
+                        std::size_t c_idx = tbl->get_col_idx(c_name);
+                        if (c_idx != static_cast<std::size_t>(-1)) {
+                            cp.func_type = CompiledFuncType::Coalesce;
+                            cp.arg_col_idx = c_idx;
+                            cp.fallback_val = fallback;
+                        }
+                    }
+                } else if (fname == "nullif") {
+                    size_t comma = inside.find(',');
+                    if (comma != std::string::npos) {
+                        std::string c_name = trim(inside.substr(0, comma));
+                        std::string cmp_val = trim(inside.substr(comma + 1));
+                        while (!cmp_val.empty() && (cmp_val.front() == '\'' || cmp_val.front() == '"')) cmp_val = cmp_val.substr(1);
+                        while (!cmp_val.empty() && (cmp_val.back() == '\'' || cmp_val.back() == '"')) cmp_val.pop_back();
+                        std::size_t c_idx = tbl->get_col_idx(c_name);
+                        if (c_idx != static_cast<std::size_t>(-1)) {
+                            cp.func_type = CompiledFuncType::Nullif;
+                            cp.arg_col_idx = c_idx;
+                            cp.fallback_val = cmp_val;
                         }
                     }
                 }
@@ -1778,18 +2454,62 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                 double d = (cp.arg_col_idx < r.size()) ? r[cp.arg_col_idx].get<double>() : 0.0;
                 double factor = std::pow(10.0, cp.round_decimals);
                 out.push_back(types::Value(std::round(d * factor) / factor));
-            } else if (cp.func_type == CompiledFuncType::JsonExtract) {
-                std::string json_str = (cp.arg_col_idx < r.size()) ? r[cp.arg_col_idx].to_string() : "{}";
-                size_t kpos = json_str.find("\"" + cp.json_key + "\"");
-                if (kpos != std::string::npos) {
-                    size_t colon = json_str.find(':', kpos);
-                    if (colon != std::string::npos) {
-                        size_t comma = json_str.find_first_of(",}", colon);
-                        std::string val_str = trim(json_str.substr(colon + 1, comma - colon - 1));
-                        if (val_str.size() >= 2 && val_str.front() == '"' && val_str.back() == '"') {
-                            val_str = val_str.substr(1, val_str.size() - 2);
+                    } else if (cp.func_type == CompiledFuncType::Abs) {
+                        double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
+                        out.push_back(types::Value(std::abs(d)));
+                    } else if (cp.func_type == CompiledFuncType::Length) {
+                        std::size_t len = (cp.arg_col_idx < r.size()) ? r[cp.arg_col_idx].to_string().size() : 0;
+                        out.push_back(types::Value(static_cast<std::int64_t>(len)));
+                    } else if (cp.func_type == CompiledFuncType::Coalesce) {
+                        if (cp.arg_col_idx < r.size() && !r[cp.arg_col_idx].is_null()) {
+                            out.push_back(r[cp.arg_col_idx]);
+                        } else {
+                            out.push_back(types::Value(cp.fallback_val, types::TypeID::Text));
                         }
-                        out.push_back(types::Value(val_str, types::TypeID::Text));
+                    } else if (cp.func_type == CompiledFuncType::Nullif) {
+                        if (cp.arg_col_idx < r.size()) {
+                            const auto& v = r[cp.arg_col_idx];
+                            if (v.to_string() == cp.fallback_val) {
+                                out.push_back(types::Value());
+                            } else {
+                                out.push_back(v);
+                            }
+                        } else {
+                            out.push_back(types::Value());
+                        }
+                    } else if (cp.func_type == CompiledFuncType::CaseWhen) {
+                        double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
+                        if (d > cp.case_threshold) {
+                            out.push_back(types::Value(cp.case_then_val, types::TypeID::Text));
+                        } else {
+                            out.push_back(types::Value(cp.case_else_val, types::TypeID::Text));
+                        }
+            } else if (cp.func_type == CompiledFuncType::JsonExtract) {
+                if (cp.arg_col_idx < r.size()) {
+                    const auto& v = r[cp.arg_col_idx];
+                    std::string_view jv;
+                    std::string tmp_s;
+                    if (v.type() == types::TypeID::Text || v.type() == types::TypeID::VarChar || v.type() == types::TypeID::JSON) {
+                        jv = v.get<std::string>();
+                    } else {
+                        tmp_s = v.to_string();
+                        jv = tmp_s;
+                    }
+                    size_t kpos = jv.find(cp.json_key);
+                    if (kpos != std::string_view::npos) {
+                        size_t colon = jv.find(':', kpos + cp.json_key.size());
+                        if (colon != std::string_view::npos) {
+                            size_t comma = jv.find_first_of(",}", colon + 1);
+                            std::string_view val_view = (comma != std::string_view::npos) ? jv.substr(colon + 1, comma - colon - 1) : jv.substr(colon + 1);
+                            while (!val_view.empty() && std::isspace(static_cast<unsigned char>(val_view.front()))) val_view.remove_prefix(1);
+                            while (!val_view.empty() && std::isspace(static_cast<unsigned char>(val_view.back()))) val_view.remove_suffix(1);
+                            if (val_view.size() >= 2 && val_view.front() == '"' && val_view.back() == '"') {
+                                val_view = val_view.substr(1, val_view.size() - 2);
+                            }
+                            out.push_back(types::Value(std::string(val_view), types::TypeID::Text));
+                        } else {
+                            out.push_back(types::Value());
+                        }
                     } else {
                         out.push_back(types::Value());
                     }
@@ -1845,6 +2565,21 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
         rows.push_back(std::move(out_row));
     }
 
+    {
+        std::unique_lock<std::shared_mutex> w_lk(s_extraction_cache_mutex);
+        CachedExtractionPlan cp_plan;
+        cp_plan.tbl_name = tbl_name;
+        cp_plan.max_rows = max_rows;
+        cp_plan.skip_rows = skip_rows;
+        cp_plan.is_distinct = is_distinct;
+        cp_plan.has_where = has_where;
+        cp_plan.pred = pred;
+        cp_plan.filter_col_idx = filter_col_idx;
+        cp_plan.compiled = compiled;
+        cp_plan.cols = cols;
+        s_extraction_plan_cache[sql_str] = std::move(cp_plan);
+    }
+
     return create_result(0, true, std::move(cols), std::move(rows), rows.size(), true);
 }
 
@@ -1853,6 +2588,58 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
 // =============================================================================
 
 inline Result execute_window_query(std::string_view sql, SharedDatabaseState& db) {
+    std::string sql_str(sql);
+    {
+        std::shared_lock<std::shared_mutex> c_lk(s_window_cache_mutex);
+        auto it = s_window_plan_cache.find(sql_str);
+        if (it != s_window_plan_cache.end()) {
+            const auto& plan = it->second;
+            auto tbl = db.get_table(plan.tbl_name);
+            if (!tbl) return create_result(0, false);
+
+            std::shared_lock<std::shared_mutex> lock(tbl->mutex);
+            std::size_t total_n = tbl->sample_rows.size();
+            std::size_t row_count = std::min<std::size_t>(plan.max_rows, total_n);
+
+            std::vector<std::size_t> indices(total_n);
+            for (std::size_t i = 0; i < total_n; ++i) indices[i] = i;
+
+            std::vector<double> sort_keys(total_n);
+            for (std::size_t i = 0; i < total_n; ++i) {
+                if (plan.sort_idx < tbl->sample_rows[i].size()) {
+                    sort_keys[i] = value_as_double(tbl->sample_rows[i][plan.sort_idx]);
+                } else {
+                    sort_keys[i] = 0.0;
+                }
+            }
+
+            if (row_count < total_n) {
+                std::partial_sort(indices.begin(), indices.begin() + row_count, indices.end(), [&](std::size_t a, std::size_t b) {
+                    return plan.desc ? (sort_keys[a] > sort_keys[b]) : (sort_keys[a] < sort_keys[b]);
+                });
+            } else {
+                std::sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+                    return plan.desc ? (sort_keys[a] > sort_keys[b]) : (sort_keys[a] < sort_keys[b]);
+                });
+            }
+
+            std::vector<std::vector<types::Value>> out_rows;
+            out_rows.reserve(row_count);
+
+            for (std::size_t i = 0; i < row_count; ++i) {
+                std::vector<types::Value> row = tbl->sample_rows[indices[i]];
+                if (plan.has_rownum) {
+                    row.push_back(types::Value(static_cast<std::int64_t>(i + 1)));
+                }
+                if (plan.has_rank) {
+                    row.push_back(types::Value(static_cast<std::int64_t>(i + 1)));
+                }
+                out_rows.push_back(std::move(row));
+            }
+            return create_result(out_rows.size(), true, plan.cols, std::move(out_rows), out_rows.size(), true);
+        }
+    }
+
     std::string s = to_lower(sql);
     
     // Extract table
@@ -1913,16 +2700,31 @@ inline Result execute_window_query(std::string_view sql, SharedDatabaseState& db
     std::size_t sort_idx = tbl->get_col_idx(sort_col);
     if (sort_idx == static_cast<std::size_t>(-1)) sort_idx = 0;
 
-    // Sort a copy of sample rows
-    std::vector<std::vector<types::Value>> sorted_rows = tbl->sample_rows;
-    std::sort(sorted_rows.begin(), sorted_rows.end(), [&](const std::vector<types::Value>& a, const std::vector<types::Value>& b) {
-        if (sort_idx >= a.size() || sort_idx >= b.size()) return false;
-        double da = value_as_double(a[sort_idx]);
-        double db_val = value_as_double(b[sort_idx]);
-        return desc ? (da > db_val) : (da < db_val);
-    });
+    std::size_t total_n = tbl->sample_rows.size();
+    std::size_t row_count = std::min<std::size_t>(max_rows, total_n);
 
-    std::size_t row_count = std::min<std::size_t>(max_rows, sorted_rows.size());
+    std::vector<std::size_t> indices(total_n);
+    for (std::size_t i = 0; i < total_n; ++i) indices[i] = i;
+
+    std::vector<double> sort_keys(total_n);
+    for (std::size_t i = 0; i < total_n; ++i) {
+        if (sort_idx < tbl->sample_rows[i].size()) {
+            sort_keys[i] = value_as_double(tbl->sample_rows[i][sort_idx]);
+        } else {
+            sort_keys[i] = 0.0;
+        }
+    }
+
+    if (row_count < total_n) {
+        std::partial_sort(indices.begin(), indices.begin() + row_count, indices.end(), [&](std::size_t a, std::size_t b) {
+            return desc ? (sort_keys[a] > sort_keys[b]) : (sort_keys[a] < sort_keys[b]);
+        });
+    } else {
+        std::sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+            return desc ? (sort_keys[a] > sort_keys[b]) : (sort_keys[a] < sort_keys[b]);
+        });
+    }
+
     std::vector<std::vector<types::Value>> out_rows;
     out_rows.reserve(row_count);
 
@@ -1930,7 +2732,7 @@ inline Result execute_window_query(std::string_view sql, SharedDatabaseState& db
     bool has_rank = (s.find("rank()") != std::string::npos);
 
     for (std::size_t i = 0; i < row_count; ++i) {
-        std::vector<types::Value> row = sorted_rows[i];
+        std::vector<types::Value> row = tbl->sample_rows[indices[i]];
         if (has_rownum) {
             row.push_back(types::Value(static_cast<std::int64_t>(i + 1)));
         }
@@ -1958,6 +2760,18 @@ inline Result execute_window_query(std::string_view sql, SharedDatabaseState& db
         cols.push_back(m);
     }
 
+    {
+        std::unique_lock<std::shared_mutex> c_lk(s_window_cache_mutex);
+        CachedWindowPlan cwp;
+        cwp.tbl_name = tbl_name;
+        cwp.max_rows = max_rows;
+        cwp.sort_idx = sort_idx;
+        cwp.desc = desc;
+        cwp.has_rownum = has_rownum;
+        cwp.has_rank = has_rank;
+        cwp.cols = cols;
+        s_window_plan_cache[sql_str] = std::move(cwp);
+    }
     return create_result(0, true, std::move(cols), std::move(out_rows), 0, true);
 }
 
@@ -2007,15 +2821,71 @@ inline Result execute_cte(std::string_view sql, SharedDatabaseState& db) {
 // 10. GROUP BY & HAVING ENGINE
 // =============================================================================
 
-inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& db) {
-    std::string s = to_lower(sql);
+struct GroupByProjItem {
+    std::string raw_expr;
+    std::string alias;
+    bool is_group_key{false};
+    std::size_t group_key_idx{0};
+    bool is_agg{false};
+    std::string agg_func;
+    std::string agg_arg;
+    std::size_t agg_col_idx{static_cast<std::size_t>(-1)};
+    ColumnMetadata meta;
+};
 
-    // 1. Extract table name
+struct CachedGroupByPlan {
+    std::string tbl_name;
+    std::vector<std::size_t> group_col_indices;
+    std::vector<std::string> group_cols;
+    bool has_where{false};
+    WherePredicate where_pred;
+    std::string having_clause;
+    std::vector<GroupByProjItem> proj_items;
+    std::vector<ColumnMetadata> out_cols;
+};
+static std::unordered_map<std::string, CachedGroupByPlan> s_groupby_plan_cache;
+static std::shared_mutex s_groupby_cache_mutex;
+
+inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& db) {
+    std::string sql_str(sql);
+    CachedGroupByPlan cached_plan;
+    bool has_cached_plan = false;
+    {
+        std::shared_lock<std::shared_mutex> c_lk(s_groupby_cache_mutex);
+        auto it = s_groupby_plan_cache.find(sql_str);
+        if (it != s_groupby_plan_cache.end()) {
+            cached_plan = it->second;
+            has_cached_plan = true;
+        }
+    }
+
+    std::string tbl_name;
+    std::vector<std::size_t> group_col_indices;
+    std::vector<std::string> group_cols;
+    bool has_where = false;
+    WherePredicate where_pred;
+    std::string having_clause;
+    std::vector<GroupByProjItem> proj_items;
+    std::vector<ColumnMetadata> out_cols;
+
+    if (has_cached_plan) {
+        tbl_name = cached_plan.tbl_name;
+        group_col_indices = cached_plan.group_col_indices;
+        group_cols = cached_plan.group_cols;
+        has_where = cached_plan.has_where;
+        where_pred = cached_plan.where_pred;
+        having_clause = cached_plan.having_clause;
+        proj_items = cached_plan.proj_items;
+        out_cols = cached_plan.out_cols;
+    } else {
+        std::string s = to_lower(sql);
+
+        // 1. Extract table name
     size_t from_p = s.find("from ");
     if (from_p == std::string::npos) return create_result(0, false);
     size_t end_from = s.find_first_of(" \t\n;", from_p + 5);
     if (end_from == std::string::npos) end_from = s.size();
-    std::string tbl_name = trim(s.substr(from_p + 5, end_from - (from_p + 5)));
+    tbl_name = trim(s.substr(from_p + 5, end_from - (from_p + 5)));
 
     auto tbl = db.get_table(tbl_name);
     if (!tbl) return create_result(0, false);
@@ -2034,8 +2904,7 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
     std::vector<std::string> proj_exprs = split_expressions(proj_part);
 
     // 3. Extract WHERE clause
-    WherePredicate where_pred;
-    bool has_where = parse_simple_where(sql, where_pred);
+    has_where = parse_simple_where(sql, where_pred);
 
     // 4. Extract GROUP BY clause
     size_t gb_pos = s.find("group by ");
@@ -2055,8 +2924,6 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
         gb_clause.remove_suffix(1);
     }
     std::vector<std::string> gb_cols_raw = split_expressions(gb_clause);
-    std::vector<std::string> group_cols;
-    std::vector<std::size_t> group_col_indices;
     for (const auto& c : gb_cols_raw) {
         std::string c_clean = trim(c);
         while (!c_clean.empty() && (c_clean.back() == ';' || std::isspace(static_cast<unsigned char>(c_clean.back())))) {
@@ -2069,7 +2936,6 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
     }
 
     // 5. Extract HAVING condition if present
-    std::string having_clause;
     if (having_p != std::string::npos) {
         size_t h_start = having_p + 8;
         size_t h_end = s.size();
@@ -2083,23 +2949,8 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
     }
 
     // 6. Analyze projections for aggregates
-    struct ProjItem {
-        std::string raw_expr;
-        std::string alias;
-        bool is_group_key{false};
-        std::size_t group_key_idx{0};
-        bool is_agg{false};
-        std::string agg_func;
-        std::string agg_arg;
-        std::size_t agg_col_idx{static_cast<std::size_t>(-1)};
-        ColumnMetadata meta;
-    };
-
-    std::vector<ProjItem> proj_items;
-    std::vector<ColumnMetadata> out_cols;
-
     for (const auto& expr : proj_exprs) {
-        ProjItem item;
+        GroupByProjItem item;
         std::string t = trim(expr);
         item.raw_expr = t;
         size_t as_p = ifind(t, " as ");
@@ -2150,6 +3001,25 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
         proj_items.push_back(item);
     }
 
+    {
+        std::unique_lock<std::shared_mutex> w_lk(s_groupby_cache_mutex);
+        CachedGroupByPlan new_plan;
+        new_plan.tbl_name = tbl_name;
+        new_plan.group_col_indices = group_col_indices;
+        new_plan.group_cols = group_cols;
+        new_plan.has_where = has_where;
+        new_plan.where_pred = where_pred;
+        new_plan.having_clause = having_clause;
+        new_plan.proj_items = proj_items;
+        new_plan.out_cols = out_cols;
+        s_groupby_plan_cache[sql_str] = std::move(new_plan);
+    }
+    } // end else (!has_cached_plan)
+
+    auto tbl_group = db.get_table(tbl_name);
+    if (!tbl_group) return create_result(0, false);
+    std::shared_lock<std::shared_mutex> lock_group(tbl_group->mutex);
+
     // 7. Group Accumulators
     struct GroupState {
         std::vector<types::Value> key_vals;
@@ -2163,8 +3033,8 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
     std::unordered_map<std::string, GroupState> groups;
     std::vector<std::string> group_order;
 
-    for (const auto& row : tbl->sample_rows) {
-        if (has_where && !eval_predicate(where_pred, row, *tbl, &db)) {
+    for (const auto& row : tbl_group->sample_rows) {
+        if (has_where && !eval_predicate(where_pred, row, *tbl_group, &db)) {
             continue;
         }
 
@@ -2305,21 +3175,22 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
     }
 
     // Limit & Offset & Fetch First
-    limit_p = ifind(s, "limit ");
-    size_t offset_p = ifind(s, "offset ");
-    size_t fetch_p = ifind(s, "fetch first ");
-    if (fetch_p == std::string::npos) fetch_p = ifind(s, "fetch next ");
+    std::string s_low = to_lower(sql);
+    size_t limit_p = ifind(s_low, "limit ");
+    size_t offset_p = ifind(s_low, "offset ");
+    size_t fetch_p = ifind(s_low, "fetch first ");
+    if (fetch_p == std::string::npos) fetch_p = ifind(s_low, "fetch next ");
     std::size_t max_rows = 1000000;
     std::size_t skip_rows = 0;
     if (limit_p != std::string::npos) {
-        try { max_rows = std::stoull(trim(s.substr(limit_p + 6))); } catch (...) {}
+        try { max_rows = std::stoull(trim(s_low.substr(limit_p + 6))); } catch (...) {}
     }
     if (fetch_p != std::string::npos) {
         size_t after_ff = fetch_p + 12;
-        try { max_rows = std::stoull(trim(s.substr(after_ff))); } catch (...) {}
+        try { max_rows = std::stoull(trim(s_low.substr(after_ff))); } catch (...) {}
     }
     if (offset_p != std::string::npos) {
-        try { skip_rows = std::stoull(trim(s.substr(offset_p + 7))); } catch (...) {}
+        try { skip_rows = std::stoull(trim(s_low.substr(offset_p + 7))); } catch (...) {}
     }
 
     if (skip_rows > 0 || out_rows.size() > max_rows) {
@@ -2482,31 +3353,57 @@ inline Result execute_alter_table(std::string_view sql, SharedDatabaseState& db)
 // 12. SET OPERATIONS (UNION, UNION ALL, INTERSECT, EXCEPT)
 // =============================================================================
 
-inline Result execute_set_operation(std::string_view sql, SharedDatabaseState& db) {
-    std::string s = to_lower(sql);
-    enum class SetOp { UnionAll, Union, Intersect, Except };
-    SetOp op = SetOp::Union;
-    size_t op_pos = std::string::npos;
-    size_t op_len = 0;
+enum class SetOp { UnionAll, Union, Intersect, Except };
+struct CachedSetOpPlan {
+    SetOp op;
+    std::string left_sql;
+    std::string right_sql;
+};
+static std::unordered_map<std::string, CachedSetOpPlan> s_setop_plan_cache;
+static std::shared_mutex s_setop_cache_mutex;
 
-    if ((op_pos = s.find(" union all ")) != std::string::npos) {
-        op = SetOp::UnionAll;
-        op_len = 11;
-    } else if ((op_pos = s.find(" union ")) != std::string::npos) {
-        op = SetOp::Union;
-        op_len = 7;
-    } else if ((op_pos = s.find(" intersect ")) != std::string::npos) {
-        op = SetOp::Intersect;
-        op_len = 11;
-    } else if ((op_pos = s.find(" except ")) != std::string::npos) {
-        op = SetOp::Except;
-        op_len = 8;
+inline Result execute_set_operation(std::string_view sql, SharedDatabaseState& db) {
+    std::string sql_str(sql);
+    SetOp op = SetOp::Union;
+    std::string left_sql;
+    std::string right_sql;
+
+    {
+        std::shared_lock<std::shared_mutex> c_lk(s_setop_cache_mutex);
+        auto it = s_setop_plan_cache.find(sql_str);
+        if (it != s_setop_plan_cache.end()) {
+            op = it->second.op;
+            left_sql = it->second.left_sql;
+            right_sql = it->second.right_sql;
+        }
     }
 
-    if (op_pos == std::string::npos) return create_result(0, false);
+    if (left_sql.empty()) {
+        std::string s = to_lower(sql);
+        size_t op_pos = std::string::npos;
+        size_t op_len = 0;
+        if ((op_pos = s.find(" union all ")) != std::string::npos) {
+            op = SetOp::UnionAll;
+            op_len = 11;
+        } else if ((op_pos = s.find(" union ")) != std::string::npos) {
+            op = SetOp::Union;
+            op_len = 7;
+        } else if ((op_pos = s.find(" intersect ")) != std::string::npos) {
+            op = SetOp::Intersect;
+            op_len = 11;
+        } else if ((op_pos = s.find(" except ")) != std::string::npos) {
+            op = SetOp::Except;
+            op_len = 8;
+        }
+        if (op_pos == std::string::npos) return create_result(0, false);
+        left_sql = trim(sql.substr(0, op_pos));
+        right_sql = trim(sql.substr(op_pos + op_len));
 
-    std::string left_sql = trim(sql.substr(0, op_pos));
-    std::string right_sql = trim(sql.substr(op_pos + op_len));
+        std::unique_lock<std::shared_mutex> w_lk(s_setop_cache_mutex);
+        s_setop_plan_cache[sql_str] = CachedSetOpPlan{op, left_sql, right_sql};
+    }
+
+
 
     Result left_res = execute_extraction_query(left_sql, db);
     Result right_res = execute_extraction_query(right_sql, db);
@@ -2520,8 +3417,9 @@ inline Result execute_set_operation(std::string_view sql, SharedDatabaseState& d
     std::vector<std::vector<types::Value>> combined;
 
     if (op == SetOp::UnionAll) {
-        combined = left_impl->rows;
-        combined.insert(combined.end(), right_impl->rows.begin(), right_impl->rows.end());
+        combined.reserve(left_impl->rows.size() + right_impl->rows.size());
+        combined = std::move(left_impl->rows);
+        combined.insert(combined.end(), std::make_move_iterator(right_impl->rows.begin()), std::make_move_iterator(right_impl->rows.end()));
     } else if (op == SetOp::Union) {
         std::unordered_set<std::string> seen;
         for (const auto& r : left_impl->rows) {

@@ -37,11 +37,18 @@ void append_u32(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
     }
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
 void append_u64(std::vector<std::uint8_t>& bytes, std::uint64_t value) {
     for (unsigned int shift = 0; shift < 64; shift += 8) {
         bytes.push_back(static_cast<std::uint8_t>((value >> shift) & 0xFF));
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 struct PageImageView {
     PageID page_id{0};
@@ -66,6 +73,10 @@ bool parse_page_image(const LogRecord& record, PageImageView& image) {
     return true;
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#endif
 std::vector<std::uint8_t> make_page_image_payload(
     PageID page_id, std::uint32_t page_size,
     const std::uint8_t* before, const std::uint8_t* after) {
@@ -77,6 +88,9 @@ std::vector<std::uint8_t> make_page_image_payload(
     payload.insert(payload.end(), after, after + page_size);
     return payload;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 } // namespace
 

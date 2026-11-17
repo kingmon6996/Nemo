@@ -2586,7 +2586,7 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
 
     // Extract projection expressions
     size_t sel_p = s.find("select ");
-    bool is_distinct = false;
+    [[maybe_unused]] bool is_distinct = false;
     size_t sel_start = sel_p + 7;
     if (s.substr(sel_p, 16).starts_with("select distinct ")) {
         is_distinct = true;
@@ -3420,7 +3420,7 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
 
     // 2. Extract projection expressions
     size_t sel_p = s.find("select ");
-    bool is_distinct = false;
+    [[maybe_unused]] bool is_distinct = false;
     size_t sel_start = sel_p + 7;
     if (s.substr(sel_p, 16).starts_with("select distinct ")) {
         is_distinct = true;

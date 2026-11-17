@@ -10,6 +10,7 @@
 #include <string_view>
 #include <thread>
 #include <charconv>
+#include <cstring>
 
 namespace nemo::api {
 
@@ -1794,7 +1795,7 @@ nemo::Result<Result> Connection::execute_impl(std::string_view sql, std::span<co
         // ON CONFLICT handling
         size_t conflict_p = s_low.find("on conflict");
         bool has_conflict = (conflict_p != std::string::npos);
-        bool on_conflict_do_nothing = (has_conflict && s_low.find("do nothing", conflict_p) != std::string::npos);
+        [[maybe_unused]] bool on_conflict_do_nothing = (has_conflict && s_low.find("do nothing", conflict_p) != std::string::npos);
         bool on_conflict_do_update = (has_conflict && s_low.find("do update set", conflict_p) != std::string::npos);
 
         size_t conflict_col_idx = 0;

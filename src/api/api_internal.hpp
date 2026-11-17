@@ -685,7 +685,7 @@ public:
                 tbl->name = t_name;
                 std::uint64_t total_r = 0;
                 ifs.read(reinterpret_cast<char*>(&total_r), sizeof(total_r));
-                if (!ifs || total_r < 0 || static_cast<std::uint64_t>(total_r) > 100000000) return false;
+                if (!ifs || static_cast<std::uint64_t>(total_r) > 100000000) return false;
                 tbl->total_rows = static_cast<std::size_t>(total_r);
 
                 std::uint64_t auto_idx = 0;

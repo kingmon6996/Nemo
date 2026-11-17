@@ -19,13 +19,11 @@ Demonstrates creating a thread-safe connection pool, acquiring leases across mul
 worker threads, and running simultaneous concurrent writers and readers without lock collisions.
 """
 
-import os
 import threading
 import time
 import nemo
 
 DB_NAME = "example10_pool_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 def worker_thread(pool, worker_id: int, ops_count: int, error_log: list):
     """Simulates a concurrent worker thread acquiring connection leases from the pool."""
@@ -105,10 +103,7 @@ def main():
             print(f"    - Total Event Records Stored  : {total_events:,}")
 
     # Clean up local database file
-    if os.path.exists(DB_FILE):
         try:
-            os.remove(DB_FILE)
-            print(f"\n[Cleanup] Cleaned up temporary database: {DB_FILE}")
         except OSError:
             pass
 

@@ -70,6 +70,7 @@ venv/
 venv-*/
 
 # --- 5. Database Binary Files, WAL & Logs ---
+.nemo/
 *.nm
 *.nm.meta
 *.nm-wal
@@ -81,14 +82,13 @@ venv-*/
 *.sqlite3
 *.log
 
-# --- 6. Local Test Scripts, Benchmarks & Datasets ---
-tests/
-test.py
-test2.py
-test3.py
+# --- 6. Benchmark & Test Runtime Artifacts ---
+# The tests/ folder IS committed to git.
+# Only ignore runtime-generated files produced during test/benchmark execution.
 dataset/
 ci_logs/
 scratch/
+bench_*.db
 
 # --- 7. IDE, Editor & OS System Files ---
 .idea/

@@ -10,7 +10,7 @@
 
 **Nemo** is an ultra-high-performance, embedded, local relational database engine engineered in modern ISO C++20 with zero-copy Python bindings. Designed from the ground up as a high-concurrency alternative to SQLite, Nemo eliminates database-level lock contention, enabling simultaneous readers and simultaneous writers without deadlocks or `database is locked` collisions.
 
-Nemo persists data into local `.nm` binary files, natively supports 22+ PostgreSQL-inspired datatypes (including `JSONB`, `RANGE`, `INET`, `CIDR`, `BIT`, `UUID`, `ARRAY`, `DICT`, and `ENUM`), provides over 70 built-in SQL scalar and extraction functions, supports database-managed sequences with atomic ID range allocation, features auto-increment primary keys, and exposes a unified synchronous and asynchronous (`asyncio`) Python SDK.
+Nemo persists data into a `.nemo/<name>/` folder in your current working directory, natively supports 22+ PostgreSQL-inspired datatypes (including `JSONB`, `RANGE`, `INET`, `CIDR`, `BIT`, `UUID`, `ARRAY`, `DICT`, and `ENUM`), provides over 70 built-in SQL scalar and extraction functions, supports database-managed sequences with atomic ID range allocation, features auto-increment primary keys, and exposes a unified synchronous and asynchronous (`asyncio`) Python SDK.
 
 ---
 
@@ -74,8 +74,13 @@ Nemo stores database pages in uniform 4096-byte slotted blocks:
 
 ## Key Features
 
-- **Embedded & Serverless**: Zero configuration, no external daemon, and zero network latency. Operates directly on `.nm` local binary files.
-- **True Concurrency**: Concurrent multi-reader and multi-writer execution using fine-grained latching and MVCC snapshot isolation.
+- **Embedded & Serverless**: Zero configuration, no external daemon, and zero network latency. Operates on a local `.nemo/<name>/` folder — no path setup required.
+- **Configurable Buffer Pool**: 8 KB slotted-page cache with CLOCK eviction. Defaults to 1/4 of available RAM (auto-detected), clamped to [32 MB, 8 GB]. Override with `buffer_pool_mb=N`.
+- **Write-Ahead Log (WAL)**: Every commit flushes a log record to `wal/` before returning success. WAL segments roll at 16 MB. WAL-before-data rule guarantees crash durability.
+- **ARIES Crash Recovery**: On every open of an existing database, the ARIES three-phase pipeline (Analysis → Redo → Undo) replays committed changes and rolls back uncommitted ones. A fuzzy checkpoint writes `master.nm` to bound recovery time.
+- **Read-Committed Concurrency**: Per-table `shared_mutex` (readers share, writers exclusive) with per-row atomic visibility flags (committed/deleted bits). Uncommitted rows are invisible to all other connections until `COMMIT`. Process-level advisory lock file prevents accidental dual-process opens.
+- **B+ Tree Secondary Indexes**: `CREATE INDEX` and `CREATE UNIQUE INDEX` build an ordered `InMemoryIndex` (`std::map<Value, vector<row_idx>>`) over any column. Equality WHERE predicates (`WHERE col = val`) automatically bypass the linear scan and use the index for O(log N) point lookups. Indexes are updated on every INSERT and rebuilt after DELETE.
+- **SIMD Column Decode**: `SUM`, `AVG`, `MIN`, and `MAX` aggregates decode column values into a contiguous `double[]` buffer and accumulate using AVX2 (4 doubles/cycle), SSE4.1 (2 doubles/cycle), or scalar fallback — selected transparently at build time.
 - **Dual Ingestion Paths**:
   - **Vectorized Bulk Streaming (`executemany`)**: Rapid streaming ingestion for massive batch workloads.
   - **Single Writing (`execute`)**: Ultra-low latency single-row inserts for real-time transaction processing.
@@ -175,7 +180,7 @@ import nemo
 ```python
 import nemo
 
-# Connect using database name (no extension required)
+# Connect by name — creates .nemo/production/ in the current working directory
 with nemo.connect("production") as db:
     with db.connect_sync() as conn:
         conn.execute("""
@@ -275,7 +280,13 @@ All technical documentation is organized in the [`docs/`](docs/) directory and r
 - [Nemo Python Functions & API Reference](docs/nemo_functions.md): Complete Python API reference for `Database`, `SyncConnection`, `AsyncConnection`, `Result`, `PreparedStatement`, and connection pools.
 - [Datatypes Reference](docs/datatypes.md): Complete specification of all 30 native datatypes, storage bounds, and Python type mapping.
 - [SQL Syntax & Query Reference](docs/sql.md): DDL, DML, constraints, auto-increment primary keys, sequences, CBO optimizer, hash joins, SIMD aggregates, window functions, and native table operations (`pop`, `count`, `truncate`).
-- [Connecting to Nemo](docs/connect.md): Detailed guide to path resolution, timeout handling, connection pooling, and lifecycle management.
+- [Connecting to Nemo](docs/connect.md): Guide to `nemo.connect(name, buffer_pool_mb)`, the `.nemo/<name>/` storage layout, name validation rules, and connection lifecycle.
+- [Buffer Pool](docs/buffer_pool.md): CLOCK eviction, pin/unpin, RAM auto-detect, flush/checkpoint, and hit-ratio statistics.
+- [Write-Ahead Log](docs/wal.md): WAL segment format, log record types, commit path, group commit, and WAL-before-data rule.
+- [Crash Recovery](docs/crash_recovery.md): ARIES Analysis→Redo→Undo pipeline, `master.nm` master record, `CheckpointManager`, `RecoveryManager`, and graceful failure modes.
+- [Concurrency](docs/concurrency.md): Read-Committed isolation, per-row atomic visibility flags, per-table `shared_mutex`, process lock file, and `compact()` behaviour.
+- [B+ Tree Index](docs/index.md): `InMemoryIndex` structure, `ValueLess` comparator, `CREATE INDEX` / `DROP INDEX` syntax, equality WHERE fast path, DELETE rebuild strategy, and uniqueness enforcement.
+- [SIMD Column Decode](docs/simd.md): `simd_decode_column`, `simd_aggregate_doubles`, AVX2/SSE4.1/scalar code paths, build flags, and aggregate integration.
 - [Synchronous Python Connector](docs/syncconnector.md): Full reference for synchronous connections, statements, columnar extraction, and cursor management.
 - [Asynchronous Python Connector](docs/asyncconnector.md): Full reference for `asyncio` execution, async cursors, and event loop integration.
 - [Transactions & Concurrency Guide](docs/transactions.md): MVCC snapshot isolation, transaction patterns, autocommit modes, and concurrency benchmarks.

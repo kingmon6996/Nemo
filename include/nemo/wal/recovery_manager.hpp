@@ -4,10 +4,9 @@
 #include "nemo/wal/wal_manager.hpp"
 #include "nemo/wal/checkpoint_manager.hpp"
 #include "nemo/wal/recovery_state.hpp"
-#include "nemo/wal/transaction_table.hpp"
-#include "nemo/wal/dirty_page_table.hpp"
 #include "nemo/storage/buffer_pool.hpp"
 #include <string>
+#include <unordered_map>
 
 namespace nemo::wal {
 
@@ -28,17 +27,23 @@ private:
     
     RecoveryState m_state{RecoveryState::NotRequired};
     
-    RecoveryTransactionTable m_txn_table;
-    DirtyPageTable m_dirty_page_table;
-    
+    struct TransactionRecoveryState {
+        LSN first_lsn{LSN::invalid()};
+        LSN last_lsn{LSN::invalid()};
+        bool committed{false};
+        bool ended{false};
+    };
+    std::unordered_map<transaction::TransactionID, TransactionRecoveryState> m_transactions;
+    std::unordered_map<std::uint64_t, LSN> m_dirty_page_table;
+    LSN m_analysis_start_lsn{LSN::invalid()};
     LSN m_redo_start_lsn{LSN::invalid()};
 
     bool phase_analysis();
     bool phase_redo();
     bool phase_undo();
     
-    void redo_record(const LogRecord& record);
-    void undo_record(const LogRecord& record);
+    bool redo_record(const LogRecord& record);
+    bool undo_record(const LogRecord& record);
 };
 
 } // namespace nemo::wal

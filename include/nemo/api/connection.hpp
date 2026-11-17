@@ -45,6 +45,10 @@ public:
     nemo::Result<void> commit();
     nemo::Result<void> rollback();
 
+    // Flush/checkpoint in-memory dirty state to persistent storage
+    nemo::Result<void> flush();
+    nemo::Result<void> checkpoint();
+
     // Set autocommit mode
     void set_autocommit(bool enabled);
 
@@ -64,6 +68,9 @@ public:
     
 private:
     friend class nemo::Database;
+    nemo::Result<void> begin_transaction_state();
+    nemo::Result<api::Result> execute_impl(
+        std::string_view sql, std::span<const types::Value> parameters);
     std::unique_ptr<ConnectionImpl> m_impl;
 };
 

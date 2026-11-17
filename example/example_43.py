@@ -8,13 +8,11 @@ maintain consistent point-in-time views without acquiring database file locks,
 while concurrent writer threads insert and update records simultaneously.
 """
 
-import os
 import threading
 import time
 import nemo
 
 DB_NAME = "example43_mvcc_snapshot"
-DB_FILE = f"{DB_NAME}.nm"
 
 def writer_worker(db, count):
     with db.connect_sync() as conn:
@@ -27,10 +25,7 @@ def main():
     print("   NEMO DATABASE ENGINE — EXAMPLE 43: MVCC SNAPSHOT ISOLATION")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -71,10 +66,7 @@ def main():
                 print("    - Fine-grained table and page latching enabled simultaneous reads and writes.")
 
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\n" + "=" * 70)
     print("   EXAMPLE 43 COMPLETED SUCCESSFULLY!")
     print("=" * 70)

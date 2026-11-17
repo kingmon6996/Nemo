@@ -22,11 +22,9 @@ Demonstrates:
 - Snapshot isolation: concurrent readers accessing consistent data without locking
 """
 
-import os
 import nemo
 
 DB_NAME = "example9_transactions_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
@@ -93,10 +91,7 @@ def main():
             print(f"    -> Alice's final balance: ${alice_final:.2f}")
 
     # Clean up local database file
-    if os.path.exists(DB_FILE):
         try:
-            os.remove(DB_FILE)
-            print(f"\n[Cleanup] Cleaned up temporary database: {DB_FILE}")
         except OSError:
             pass
 

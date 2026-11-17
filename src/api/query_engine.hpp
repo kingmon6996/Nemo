@@ -2,6 +2,15 @@
 #ifndef NEMO_SRC_API_QUERY_ENGINE_HPP
 #define NEMO_SRC_API_QUERY_ENGINE_HPP
 
+// Phase 7: SIMD column decode — include intrinsics when available
+#if defined(__AVX2__)
+#  include <immintrin.h>
+#  define NEMO_HAVE_AVX2 1
+#elif defined(__SSE4_1__)
+#  include <immintrin.h>
+#  define NEMO_HAVE_SSE4 1
+#endif
+
 #include "api_internal.hpp"
 #include "function_registry.hpp"
 #include "nemo/types/value.hpp"
@@ -392,6 +401,10 @@ struct WherePredicate {
     mutable bool in_int_cached{false};
     mutable std::unordered_set<std::int64_t> in_int_cache;
     mutable std::vector<std::int64_t> in_int_vec;
+    // Small-int bitset for IN predicates where all values fit in [0,127]:
+    // in_bitset[0] covers bits 0-63, in_bitset[1] covers bits 64-127.
+    mutable std::uint64_t in_bitset[2]{0, 0};
+    mutable bool in_bitset_valid{false};
     mutable std::size_t col_idx_cache{static_cast<std::size_t>(-1)};
 
     std::vector<WherePredicate> and_preds;
@@ -648,6 +661,35 @@ inline bool parse_simple_where(std::string_view sql, WherePredicate& pred) {
 }
 
 inline bool match_like_pattern(std::string_view text, std::string_view pattern) {
+    // Fast path: pure suffix wildcard with no leading wildcards (e.g. 'trader_%')
+    // Find the first '%' - everything before it is a literal prefix we can fast-compare
+    {
+        size_t first_pct = pattern.find('%');
+        if (first_pct == std::string_view::npos) {
+            // No wildcards at all - must match exactly (case-insensitive, '_' = any char)
+            if (text.size() != pattern.size()) return false;
+            for (size_t i = 0; i < pattern.size(); ++i) {
+                if (pattern[i] != '_' && std::tolower(static_cast<unsigned char>(text[i])) != std::tolower(static_cast<unsigned char>(pattern[i]))) return false;
+            }
+            return true;
+        }
+        // All chars before first_pct must be literal or '_'
+        // We can verify the literal prefix up to the first '_' or '%'
+        size_t first_wild = pattern.find_first_of("_%");
+        if (first_wild > 0) {
+            // There is a literal prefix before any wildcard
+            std::string_view lit_prefix = pattern.substr(0, first_wild);
+            if (text.size() < lit_prefix.size()) return false;
+            for (size_t i = 0; i < lit_prefix.size(); ++i) {
+                if (std::tolower(static_cast<unsigned char>(text[i])) != std::tolower(static_cast<unsigned char>(lit_prefix[i]))) return false;
+            }
+            // If the rest of the pattern is just '%', we are done (prefix match)
+            std::string_view rest = pattern.substr(first_wild);
+            bool rest_all_pct = true;
+            for (char ch : rest) { if (ch != '%') { rest_all_pct = false; break; } }
+            if (rest_all_pct) return true;
+        }
+    }
     if (pattern.size() >= 1 && pattern.back() == '%' && pattern.find('_') == std::string_view::npos) {
         std::string_view prefix = pattern.substr(0, pattern.size() - 1);
         if (prefix.find('%') == std::string_view::npos) {
@@ -683,7 +725,72 @@ inline bool eval_predicate(
     const TableData& tbl,
     SharedDatabaseState* db_state = nullptr
 ) {
+    if (r.empty()) return false;
     if (!pred.and_preds.empty()) {
+        // Fast path: when all and_preds are simple numeric/IN predicates,
+        // evaluate them inline without full recursive eval_predicate overhead.
+        bool all_numeric = true;
+        for (const auto& ap : pred.and_preds) {
+            if (!ap.and_preds.empty() || !ap.or_preds.empty()) { all_numeric = false; break; }
+            // Allow numeric ops and IN with non-empty values
+            if (!ap.is_numeric && !(ap.op == "in" && !ap.in_values.empty())) {
+                all_numeric = false; break;
+            }
+        }
+        if (all_numeric) {
+            for (const auto& ap : pred.and_preds) {
+                if (ap.col_idx_cache == static_cast<std::size_t>(-1)) {
+                    ap.col_idx_cache = tbl.get_col_idx(ap.column);
+                }
+                std::size_t ci = ap.col_idx_cache;
+                if (ci == static_cast<std::size_t>(-1) || ci >= r.size()) return false;
+                const auto& v = r[ci];
+                if (v.is_null()) return false;
+                if (ap.op == "in") {
+                    // Integer IN fast path with bitset for values 0-127
+                    if (!ap.in_int_cached) {
+                        bool all_int = true;
+                        ap.in_int_vec.clear();
+                        ap.in_bitset[0] = ap.in_bitset[1] = 0;
+                        ap.in_bitset_valid = true;
+                        for (const auto& iv : ap.in_values) {
+                            char* ep = nullptr;
+                            std::int64_t ival = std::strtoll(iv.c_str(), &ep, 10);
+                            if (ep != iv.c_str() && *ep == '\0') {
+                                ap.in_int_vec.push_back(ival);
+                                if (ival >= 0 && ival < 128) {
+                                    ap.in_bitset[ival >> 6] |= (std::uint64_t(1) << (ival & 63));
+                                } else {
+                                    ap.in_bitset_valid = false;
+                                }
+                            } else { all_int = false; break; }
+                        }
+                        if (!all_int) { ap.in_int_vec.clear(); ap.in_bitset_valid = false; }
+                        ap.in_int_cached = true;
+                    }
+                    if (!ap.in_int_vec.empty()) {
+                        std::int64_t target = value_as_int64(v);
+                        bool found = false;
+                        if (ap.in_bitset_valid && target >= 0 && target < 128) {
+                            found = (ap.in_bitset[target >> 6] >> (target & 63)) & 1;
+                        } else {
+                            for (auto iv : ap.in_int_vec) { if (target == iv) { found = true; break; } }
+                        }
+                        if (!found) return false;
+                    }
+                } else {
+                    double d = value_as_double(v);
+                    if (ap.op == "between") { if (!(d >= ap.num_low && d <= ap.num_high)) return false; }
+                    else if (ap.op == "=")  { if (d != ap.num_value) return false; }
+                    else if (ap.op == ">")  { if (!(d > ap.num_value)) return false; }
+                    else if (ap.op == ">=") { if (!(d >= ap.num_value)) return false; }
+                    else if (ap.op == "<")  { if (!(d < ap.num_value)) return false; }
+                    else if (ap.op == "<=") { if (!(d <= ap.num_value)) return false; }
+                    else { if (!eval_predicate(ap, r, tbl, db_state)) return false; }
+                }
+            }
+            return true;
+        }
         for (const auto& ap : pred.and_preds) {
             if (!eval_predicate(ap, r, tbl, db_state)) return false;
         }
@@ -740,24 +847,36 @@ inline bool eval_predicate(
         if (!pred.in_int_cached) {
             bool all_int = true;
             pred.in_int_vec.clear();
+            pred.in_bitset[0] = pred.in_bitset[1] = 0;
+            pred.in_bitset_valid = true;
             for (const auto& iv : pred.in_values) {
                 char* ep = nullptr;
                 std::int64_t ival = std::strtoll(iv.c_str(), &ep, 10);
                 if (ep != iv.c_str() && *ep == '\0') {
                     pred.in_int_vec.push_back(ival);
+                    if (ival >= 0 && ival < 128) {
+                        pred.in_bitset[ival >> 6] |= (std::uint64_t(1) << (ival & 63));
+                    } else {
+                        pred.in_bitset_valid = false;
+                    }
                 } else {
                     all_int = false;
                     break;
                 }
             }
-            if (!all_int) pred.in_int_vec.clear();
+            if (!all_int) { pred.in_int_vec.clear(); pred.in_bitset_valid = false; }
             pred.in_int_cached = true;
         }
         if (!pred.in_int_vec.empty()) {
             std::int64_t target = value_as_int64(v);
             bool found = false;
-            for (auto iv : pred.in_int_vec) {
-                if (target == iv) { found = true; break; }
+            if (pred.in_bitset_valid && target >= 0 && target < 128) {
+                // Single bitset lookup: O(1) instead of O(n) linear scan
+                found = (pred.in_bitset[target >> 6] >> (target & 63)) & 1;
+            } else {
+                for (auto iv : pred.in_int_vec) {
+                    if (target == iv) { found = true; break; }
+                }
             }
             return (pred.op == "in") ? found : !found;
         }
@@ -908,6 +1027,57 @@ inline types::Value parse_extracted_json_value(const std::string& val_str) {
 // 2. SCHEMA & CREATE TABLE PARSER
 // =============================================================================
 
+inline types::TypeID parse_sql_type_id(std::string_view type_name) {
+    const std::string lower_type = to_lower(trim(type_name));
+    if (lower_type.starts_with("bool")) return types::TypeID::Boolean;
+    if (lower_type.starts_with("smallint") || lower_type.starts_with("int2")) return types::TypeID::SmallInt;
+    if (lower_type.starts_with("bigint") || lower_type.starts_with("int8")) return types::TypeID::BigInt;
+    if (lower_type.starts_with("interval")) return types::TypeID::Interval;
+    if (lower_type.starts_with("int")) return types::TypeID::Integer;
+    if (lower_type.starts_with("real") || lower_type.starts_with("float")) return types::TypeID::Real;
+    if (lower_type.starts_with("double")) return types::TypeID::Double;
+    if (lower_type.starts_with("decimal") || lower_type.starts_with("numeric")) return types::TypeID::Numeric;
+    if (lower_type.starts_with("varchar") || lower_type.starts_with("character varying")) return types::TypeID::VarChar;
+    if (lower_type.starts_with("char")) return types::TypeID::Char;
+    if (lower_type.starts_with("text")) return types::TypeID::Text;
+    if (lower_type.starts_with("bytea") || lower_type.starts_with("blob")) return types::TypeID::Bytea;
+    if (lower_type.starts_with("date")) return types::TypeID::Date;
+    if (lower_type.starts_with("timestamptz") ||
+        lower_type.starts_with("timestamp with time zone")) return types::TypeID::TimestampTZ;
+    if (lower_type.starts_with("timestamp")) return types::TypeID::Timestamp;
+    if (lower_type.starts_with("time")) return types::TypeID::Time;
+    if (lower_type.starts_with("uuid")) return types::TypeID::UUID;
+    if (lower_type.starts_with("jsonb")) return types::TypeID::JSONB;
+    if (lower_type.starts_with("json")) return types::TypeID::JSON;
+    if (lower_type.starts_with("dict")) return types::TypeID::DICT;
+    if (lower_type.starts_with("array")) return types::TypeID::Array;
+    if (lower_type.starts_with("enum")) return types::TypeID::Enum;
+    if (lower_type.starts_with("varbit")) return types::TypeID::VarBit;
+    if (lower_type.starts_with("bit")) return types::TypeID::Bit;
+    if (lower_type.starts_with("inet")) return types::TypeID::Inet;
+    if (lower_type.starts_with("cidr")) return types::TypeID::Cidr;
+    if (lower_type.starts_with("macaddr")) return types::TypeID::MacAddr;
+    if (lower_type.starts_with("range")) return types::TypeID::Range;
+    return types::TypeID::Integer;
+}
+
+inline types::TypeID parse_sql_column_type(std::string_view definition) {
+    std::stringstream ss{std::string(definition)};
+    std::string column_name;
+    std::string type_name;
+    ss >> column_name >> type_name;
+    if (column_name.empty() || type_name.empty()) return types::TypeID::Integer;
+
+    const auto remainder = to_lower(trim(definition.substr(column_name.size())));
+    if (remainder.starts_with("character varying")) {
+        return types::TypeID::VarChar;
+    }
+    if (remainder.starts_with("timestamp with time zone")) {
+        return types::TypeID::TimestampTZ;
+    }
+    return parse_sql_type_id(type_name);
+}
+
 inline std::vector<ColumnMetadata> parse_create_table_columns(std::string_view sql, const std::string& table_name) {
     std::vector<ColumnMetadata> cols;
     size_t start = sql.find('(');
@@ -939,29 +1109,9 @@ inline std::vector<ColumnMetadata> parse_create_table_columns(std::string_view s
         meta.table = table_name;
         meta.nullable = (ifind(trimmed, "NOT NULL") == std::string_view::npos);
 
-        std::string lower_type = to_lower(col_type);
-        if (lower_type.starts_with("bool")) meta.type = 1;
-        else if (lower_type.starts_with("smallint") || lower_type.starts_with("int2")) meta.type = 2;
-        else if (lower_type.starts_with("bigint") || lower_type.starts_with("int8")) meta.type = 4;
-        else if (lower_type.starts_with("int")) meta.type = 3;
-        else if (lower_type.starts_with("real") || lower_type.starts_with("float")) meta.type = 5;
-        else if (lower_type.starts_with("double")) meta.type = 6;
-        else if (lower_type.starts_with("decimal") || lower_type.starts_with("numeric")) meta.type = 7;
-        else if (lower_type.starts_with("varchar") || lower_type.starts_with("char")) meta.type = 8;
-        else if (lower_type.starts_with("text")) meta.type = 9;
-        else if (lower_type.starts_with("jsonb") || lower_type.starts_with("json")) meta.type = 10;
-        else if (lower_type.starts_with("uuid")) meta.type = 11;
-        else if (lower_type.starts_with("date")) meta.type = 12;
-        else if (lower_type.starts_with("time")) meta.type = 13;
-        else if (lower_type.starts_with("timestamp")) meta.type = 14;
-        else if (lower_type.starts_with("blob") || lower_type.starts_with("bytea")) meta.type = 15;
-        else if (lower_type.starts_with("array")) meta.type = 16;
-        else if (lower_type.starts_with("dict")) meta.type = 17;
-        else if (lower_type.starts_with("enum")) meta.type = 18;
-        else if (lower_type.starts_with("bit") || lower_type.starts_with("varbit")) meta.type = 19;
-        else if (lower_type.starts_with("inet") || lower_type.starts_with("cidr") || lower_type.starts_with("macaddr")) meta.type = 20;
-        else if (lower_type.starts_with("range")) meta.type = 21;
-        else meta.type = 3; // Default integer
+        const std::string lower_type = to_lower(col_type);
+        const auto column_type = parse_sql_column_type(trimmed);
+        meta.type = static_cast<int>(column_type);
 
         // Detect autoincrement identity column
         bool is_auto = (ifind(trimmed, "autoincrement") != std::string_view::npos ||
@@ -1180,6 +1330,93 @@ inline QueryPlan optimize_query(std::string_view sql, SharedDatabaseState& db) {
 }
 
 // =============================================================================
+// Phase 7: SIMD Column Decode helpers
+// =============================================================================
+
+// Decode a column of Values into a contiguous double buffer, skipping nulls.
+// Returns the number of valid (non-null) elements written to `out`.
+inline std::size_t simd_decode_column(
+    const std::vector<std::vector<types::Value>>& rows,
+    std::size_t col_idx,
+    std::vector<double>& out) noexcept {
+    out.clear();
+    out.reserve(rows.size());
+    for (const auto& row : rows) {
+        if (col_idx < row.size() && !row[col_idx].is_null()) {
+            out.push_back(value_as_double(row[col_idx]));
+        }
+    }
+    return out.size();
+}
+
+// Accumulate SUM, MIN, MAX over a decoded double buffer.
+// Uses AVX2 (8×double/iter) → SSE4.1 (2×double/iter) → scalar fallback.
+struct SimdAggResult { double sum{0.0}; double mn{1e30}; double mx{-1e30}; };
+
+[[nodiscard]] inline SimdAggResult simd_aggregate_doubles(
+    const double* data, std::size_t n) noexcept {
+    SimdAggResult res;
+    if (n == 0) return res;
+
+#if defined(NEMO_HAVE_AVX2)
+    __m256d vsum = _mm256_setzero_pd();
+    __m256d vmin = _mm256_set1_pd(1e30);
+    __m256d vmax = _mm256_set1_pd(-1e30);
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        __m256d v = _mm256_loadu_pd(data + i);
+        vsum = _mm256_add_pd(vsum, v);
+        vmin = _mm256_min_pd(vmin, v);
+        vmax = _mm256_max_pd(vmax, v);
+    }
+    // Horizontal reduction
+    alignas(32) double sbuf[4], mnbuf[4], mxbuf[4];
+    _mm256_storeu_pd(sbuf, vsum);
+    _mm256_storeu_pd(mnbuf, vmin);
+    _mm256_storeu_pd(mxbuf, vmax);
+    res.sum = sbuf[0] + sbuf[1] + sbuf[2] + sbuf[3];
+    res.mn  = std::min({mnbuf[0], mnbuf[1], mnbuf[2], mnbuf[3]});
+    res.mx  = std::max({mxbuf[0], mxbuf[1], mxbuf[2], mxbuf[3]});
+    // Scalar tail
+    for (; i < n; ++i) {
+        res.sum += data[i];
+        if (data[i] < res.mn) res.mn = data[i];
+        if (data[i] > res.mx) res.mx = data[i];
+    }
+#elif defined(NEMO_HAVE_SSE4)
+    __m128d vsum = _mm_setzero_pd();
+    __m128d vmin = _mm_set1_pd(1e30);
+    __m128d vmax = _mm_set1_pd(-1e30);
+    std::size_t i = 0;
+    for (; i + 2 <= n; i += 2) {
+        __m128d v = _mm_loadu_pd(data + i);
+        vsum = _mm_add_pd(vsum, v);
+        vmin = _mm_min_pd(vmin, v);
+        vmax = _mm_max_pd(vmax, v);
+    }
+    alignas(16) double sbuf[2], mnbuf[2], mxbuf[2];
+    _mm_storeu_pd(sbuf, vsum);
+    _mm_storeu_pd(mnbuf, vmin);
+    _mm_storeu_pd(mxbuf, vmax);
+    res.sum = sbuf[0] + sbuf[1];
+    res.mn  = std::min(mnbuf[0], mnbuf[1]);
+    res.mx  = std::max(mxbuf[0], mxbuf[1]);
+    for (; i < n; ++i) {
+        res.sum += data[i];
+        if (data[i] < res.mn) res.mn = data[i];
+        if (data[i] > res.mx) res.mx = data[i];
+    }
+#else
+    for (std::size_t i = 0; i < n; ++i) {
+        res.sum += data[i];
+        if (data[i] < res.mn) res.mn = data[i];
+        if (data[i] > res.mx) res.mx = data[i];
+    }
+#endif
+    return res;
+}
+
+// =============================================================================
 // 5. VECTORIZED AGGREGATE EXECUTION ENGINE (SIMD / 1024 CHUNKS)
 // =============================================================================
 
@@ -1205,29 +1442,19 @@ inline Result execute_vectorized_aggregates(std::string_view sql, SharedDatabase
                 std::size_t count_val{0};
             };
             std::unordered_map<std::size_t, AggColReq> col_stats;
+            // Phase 7: SIMD column decode — extract doubles then accumulate
+            std::vector<double> col_buf;
             for (std::size_t c_idx : plan.required_cols) {
-                double s = 0.0;
-                double mn = 1e30;
-                double mx = -1e30;
-                std::size_t cnt = 0;
-                for (std::size_t r = 0; r < N; ++r) {
-                    if (c_idx < tbl->sample_rows[r].size()) {
-                        const auto& v = tbl->sample_rows[r][c_idx];
-                        if (!v.is_null()) {
-                            double d = value_as_double(v);
-                            s += d;
-                            if (d < mn) mn = d;
-                            if (d > mx) mx = d;
-                            cnt++;
-                        }
-                    }
-                }
+                std::size_t cnt = simd_decode_column(tbl->sample_rows, c_idx, col_buf);
                 auto& cs = col_stats[c_idx];
                 cs.col_idx = c_idx;
-                cs.sum_val = s;
-                cs.min_val = mn;
-                cs.max_val = mx;
                 cs.count_val = cnt;
+                if (cnt > 0) {
+                    SimdAggResult ar = simd_aggregate_doubles(col_buf.data(), cnt);
+                    cs.sum_val = ar.sum;
+                    cs.min_val = ar.mn;
+                    cs.max_val = ar.mx;
+                }
             }
 
             double scale = (N > 0 && total_rows > N) ? (static_cast<double>(total_rows) / static_cast<double>(N)) : 1.0;
@@ -1327,28 +1554,17 @@ inline Result execute_vectorized_aggregates(std::string_view sql, SharedDatabase
         expr_plans.push_back(ep);
     }
 
-    // Truly single pass over sample_rows for all non-count aggregates
+    // Phase 7: SIMD column decode — extract doubles then accumulate
+    std::vector<double> simd_col_buf;
     for (auto& [c_idx, stats] : col_stats) {
-        double col_sum = 0.0;
-        double mn = 1e30;
-        double mx = -1e30;
-        std::size_t cnt = 0;
-        for (std::size_t r = 0; r < N; ++r) {
-            if (c_idx < tbl->sample_rows[r].size()) {
-                const auto& v = tbl->sample_rows[r][c_idx];
-                if (!v.is_null()) {
-                    double d = value_as_double(v);
-                    col_sum += d;
-                    if (d < mn) mn = d;
-                    if (d > mx) mx = d;
-                    cnt++;
-                }
-            }
-        }
-        stats.sum_val = col_sum;
-        stats.min_val = mn;
-        stats.max_val = mx;
+        std::size_t cnt = simd_decode_column(tbl->sample_rows, c_idx, simd_col_buf);
         stats.count_val = cnt;
+        if (cnt > 0) {
+            SimdAggResult ar = simd_aggregate_doubles(simd_col_buf.data(), cnt);
+            stats.sum_val = ar.sum;
+            stats.min_val = ar.mn;
+            stats.max_val = ar.mx;
+        }
     }
 
     double scale = (N > 0 && total_rows > N) ? (static_cast<double>(total_rows) / static_cast<double>(N)) : 1.0;
@@ -1999,9 +2215,17 @@ struct CompiledProj {
     double round_decimals{0.0};
     std::string json_key{""};
     std::string fallback_val{""};
+    double fallback_double{0.0};
+    bool fallback_is_numeric{false};
     double case_threshold{0.0};
     std::string case_then_val{""};
     std::string case_else_val{""};
+    // Pre-built Value objects for CaseWhen to avoid per-row string construction
+    types::Value case_then_value;
+    types::Value case_else_value;
+    // Per-plan result caches for upper/lower (keyed by input string, stores pre-built Value)
+    mutable std::unordered_map<std::string, types::Value> upper_cache;
+    mutable std::unordered_map<std::string, types::Value> lower_cache;
 };
 
 struct CachedExtractionPlan {
@@ -2025,6 +2249,7 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
         auto it = s_extraction_plan_cache.find(sql_str);
         if (it != s_extraction_plan_cache.end()) {
             const auto& plan = it->second;
+            // Use db.get_table to avoid extra lock — but try shared_ptr copy first from db.tables
             auto tbl = db.get_table(plan.tbl_name);
             if (!tbl) return create_result(0, false);
 
@@ -2070,17 +2295,49 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                         }
                     } else if (cp.func_type == CompiledFuncType::Upper) {
                         if (cp.arg_col_idx < r.size()) {
-                            std::string s_tmp = r[cp.arg_col_idx].to_string();
-                            for (char& ch : s_tmp) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-                            out.push_back(types::Value(std::move(s_tmp), types::TypeID::Text));
+                            const auto& _uv = r[cp.arg_col_idx];
+                            const std::string* src_ptr = nullptr;
+                            std::string tmp_str;
+                            if (_uv.type() == types::TypeID::Text || _uv.type() == types::TypeID::VarChar || _uv.type() == types::TypeID::Char) {
+                                src_ptr = &_uv.get<std::string>();
+                            } else {
+                                tmp_str = _uv.to_string();
+                                src_ptr = &tmp_str;
+                            }
+                            auto it = cp.upper_cache.find(*src_ptr);
+                            if (it != cp.upper_cache.end()) {
+                                out.push_back(it->second);
+                            } else {
+                                std::string s_tmp = *src_ptr;
+                                for (char& ch : s_tmp) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                                types::Value v_tmp(s_tmp, types::TypeID::Text);
+                                cp.upper_cache.emplace(*src_ptr, v_tmp);
+                                out.push_back(std::move(v_tmp));
+                            }
                         } else {
                             out.push_back(types::Value());
                         }
                     } else if (cp.func_type == CompiledFuncType::Lower) {
                         if (cp.arg_col_idx < r.size()) {
-                            std::string s_tmp = r[cp.arg_col_idx].to_string();
-                            for (char& ch : s_tmp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-                            out.push_back(types::Value(std::move(s_tmp), types::TypeID::Text));
+                            const auto& _lv = r[cp.arg_col_idx];
+                            const std::string* src_ptr = nullptr;
+                            std::string tmp_str;
+                            if (_lv.type() == types::TypeID::Text || _lv.type() == types::TypeID::VarChar || _lv.type() == types::TypeID::Char) {
+                                src_ptr = &_lv.get<std::string>();
+                            } else {
+                                tmp_str = _lv.to_string();
+                                src_ptr = &tmp_str;
+                            }
+                            auto it = cp.lower_cache.find(*src_ptr);
+                            if (it != cp.lower_cache.end()) {
+                                out.push_back(it->second);
+                            } else {
+                                std::string s_tmp = *src_ptr;
+                                for (char& ch : s_tmp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                                types::Value v_tmp(s_tmp, types::TypeID::Text);
+                                cp.lower_cache.emplace(*src_ptr, v_tmp);
+                                out.push_back(std::move(v_tmp));
+                            }
                         } else {
                             out.push_back(types::Value());
                         }
@@ -2092,8 +2349,18 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                         double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
                         out.push_back(types::Value(std::abs(d)));
                     } else if (cp.func_type == CompiledFuncType::Length) {
-                        std::size_t len = (cp.arg_col_idx < r.size()) ? r[cp.arg_col_idx].to_string().size() : 0;
-                        out.push_back(types::Value(static_cast<std::int64_t>(len)));
+                        if (cp.arg_col_idx < r.size()) {
+                            const auto& _lenv = r[cp.arg_col_idx];
+                            std::size_t len = 0;
+                            if (_lenv.type() == types::TypeID::Text || _lenv.type() == types::TypeID::VarChar || _lenv.type() == types::TypeID::Char) {
+                                len = _lenv.get<std::string>().size();
+                            } else {
+                                len = _lenv.to_string().size();
+                            }
+                            out.push_back(types::Value(static_cast<std::int64_t>(len)));
+                        } else {
+                            out.push_back(types::Value(static_cast<std::int64_t>(0)));
+                        }
                     } else if (cp.func_type == CompiledFuncType::Coalesce) {
                         if (cp.arg_col_idx < r.size() && !r[cp.arg_col_idx].is_null()) {
                             out.push_back(r[cp.arg_col_idx]);
@@ -2103,7 +2370,36 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                     } else if (cp.func_type == CompiledFuncType::Nullif) {
                         if (cp.arg_col_idx < r.size()) {
                             const auto& v = r[cp.arg_col_idx];
-                            if (v.to_string() == cp.fallback_val) {
+                            bool is_equal = false;
+                            if (cp.fallback_is_numeric) {
+                                auto t = v.type();
+                                if (t == types::TypeID::BigInt || t == types::TypeID::Integer ||
+                                    t == types::TypeID::SmallInt || t == types::TypeID::Double ||
+                                    t == types::TypeID::Real || t == types::TypeID::Boolean) {
+                                    is_equal = (value_as_double(v) == cp.fallback_double);
+                                } else {
+                                    const std::string* sv_ptr = nullptr;
+                                    std::string tmp_nf;
+                                    if (t == types::TypeID::Text || t == types::TypeID::VarChar || t == types::TypeID::Char) {
+                                        sv_ptr = &v.get<std::string>();
+                                    } else {
+                                        tmp_nf = v.to_string();
+                                        sv_ptr = &tmp_nf;
+                                    }
+                                    is_equal = (*sv_ptr == cp.fallback_val);
+                                }
+                            } else {
+                                const std::string* sv_ptr = nullptr;
+                                std::string tmp_nf;
+                                if (v.type() == types::TypeID::Text || v.type() == types::TypeID::VarChar || v.type() == types::TypeID::Char) {
+                                    sv_ptr = &v.get<std::string>();
+                                } else {
+                                    tmp_nf = v.to_string();
+                                    sv_ptr = &tmp_nf;
+                                }
+                                is_equal = (*sv_ptr == cp.fallback_val);
+                            }
+                            if (is_equal) {
                                 out.push_back(types::Value());
                             } else {
                                 out.push_back(v);
@@ -2114,9 +2410,9 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                     } else if (cp.func_type == CompiledFuncType::CaseWhen) {
                         double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
                         if (d > cp.case_threshold) {
-                            out.push_back(types::Value(cp.case_then_val, types::TypeID::Text));
+                            out.push_back(cp.case_then_value);
                         } else {
-                            out.push_back(types::Value(cp.case_else_val, types::TypeID::Text));
+                            out.push_back(cp.case_else_value);
                         }
                     } else {
                         out.push_back(evaluate_scalar_func(cp.expr, r, *tbl, &db));
@@ -2124,6 +2420,33 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                 }
                 return out;
             };
+
+            // === ZERO-COPY FAST PATH: SELECT * (all DirectCol, no WHERE, no DISTINCT, no OFFSET) ===
+            // When all projections are DirectCol and cover all table columns in order,
+            // return the table reference directly without materializing rows.
+            if (!plan.has_where && !plan.is_distinct && plan.skip_rows == 0) {
+                bool all_direct = true;
+                bool all_cols_in_order = (plan.compiled.size() == tbl->columns.size());
+                for (std::size_t ci = 0; ci < plan.compiled.size(); ++ci) {
+                    if (plan.compiled[ci].kind != CompiledProj::Kind::DirectCol ||
+                        plan.compiled[ci].col_idx != ci) {
+                        all_direct = false;
+                        break;
+                    }
+                }
+                if (all_direct && all_cols_in_order) {
+                    auto r_impl = std::make_unique<ResultImpl>();
+                    r_impl->affected_rows = 0;
+                    r_impl->has_rows = true;
+                    r_impl->is_exact = true;
+                    r_impl->columns = plan.cols;
+                    r_impl->table_ref = tbl;
+                    r_impl->is_slice = true;
+                    r_impl->slice_start = 0;
+                    r_impl->total_rows = std::min(tbl->sample_rows.size(), plan.max_rows);
+                    return Result(std::move(r_impl));
+                }
+            }
 
             std::vector<std::vector<types::Value>> rows;
             rows.reserve(std::min<std::size_t>(plan.max_rows, tbl->sample_rows.size()));
@@ -2135,25 +2458,92 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
             std::size_t loop_end = tbl->sample_rows.size();
 
             // Direct index slice optimization for ID predicates
+            // When column 0 is an integer-based ID and the slice is exact, skip eval_predicate.
+            bool skip_predicate = false;
             if (plan.has_where && plan.filter_col_idx == 0 && plan.pred.is_numeric) {
                 if (plan.pred.op == "<=") {
                     std::size_t max_id = static_cast<std::size_t>(plan.pred.num_value);
-                    if (max_id >= 1 && max_id < loop_end) loop_end = max_id;
+                    if (max_id >= 1 && max_id < loop_end) {
+                        loop_end = max_id;
+                        skip_predicate = true; // slice is exact for id <= N
+                    }
                 } else if (plan.pred.op == "between") {
                     std::size_t low_id = static_cast<std::size_t>(plan.pred.num_low);
                     std::size_t high_id = static_cast<std::size_t>(plan.pred.num_high);
                     if (low_id >= 1 && low_id <= loop_end && high_id >= low_id) {
                         loop_start = low_id - 1;
                         loop_end = std::min(high_id, loop_end);
+                        skip_predicate = true; // slice is exact for id BETWEEN low AND high
                     }
+                }
+            }
+
+            // Reserve exact capacity when we know the slice size
+            if (skip_predicate && plan.skip_rows == 0 && !plan.is_distinct) {
+                // Zero-copy slice return when all projections are DirectCol in order (SELECT *)
+                bool all_direct2 = true;
+                bool all_cols2 = (plan.compiled.size() == tbl->columns.size());
+                for (std::size_t ci = 0; ci < plan.compiled.size() && all_direct2; ++ci) {
+                    if (plan.compiled[ci].kind != CompiledProj::Kind::DirectCol ||
+                        plan.compiled[ci].col_idx != ci) all_direct2 = false;
+                }
+                if (all_direct2 && all_cols2) {
+                    std::size_t sl_rows = std::min<std::size_t>(plan.max_rows, loop_end - loop_start);
+                    auto r_impl2 = std::make_unique<ResultImpl>();
+                    r_impl2->affected_rows = 0;
+                    r_impl2->has_rows = true;
+                    r_impl2->is_exact = true;
+                    r_impl2->columns = plan.cols;
+                    r_impl2->table_ref = tbl;
+                    r_impl2->is_slice = true;
+                    r_impl2->slice_start = loop_start;
+                    r_impl2->total_rows = sl_rows;
+                    return Result(std::move(r_impl2));
+                }
+                std::size_t cap = std::min<std::size_t>(plan.max_rows, loop_end - loop_start);
+                rows.reserve(cap);
+            }
+
+            // Pre-initialize IN bitset if needed (lazy init for cache-hit path)
+            if (plan.has_where && !skip_predicate &&
+                plan.pred.op == "in" && !plan.pred.in_int_cached &&
+                plan.pred.and_preds.empty() && plan.pred.or_preds.empty()) {
+                bool all_int = true;
+                plan.pred.in_int_vec.clear();
+                plan.pred.in_bitset[0] = plan.pred.in_bitset[1] = 0;
+                plan.pred.in_bitset_valid = true;
+                for (const auto& iv : plan.pred.in_values) {
+                    char* ep = nullptr;
+                    std::int64_t ival = std::strtoll(iv.c_str(), &ep, 10);
+                    if (ep != iv.c_str() && *ep == '\0') {
+                        plan.pred.in_int_vec.push_back(ival);
+                        if (ival >= 0 && ival < 128) {
+                            plan.pred.in_bitset[ival >> 6] |= (std::uint64_t(1) << (ival & 63));
+                        } else { plan.pred.in_bitset_valid = false; }
+                    } else { all_int = false; break; }
+                }
+                if (!all_int) { plan.pred.in_int_vec.clear(); plan.pred.in_bitset_valid = false; }
+                plan.pred.in_int_cached = true;
+                if (plan.pred.col_idx_cache == static_cast<std::size_t>(-1)) {
+                    plan.pred.col_idx_cache = tbl->get_col_idx(plan.pred.column);
                 }
             }
 
             for (std::size_t ri = loop_start; ri < loop_end; ++ri) {
                 const auto& r = tbl->sample_rows[ri];
                 if (rows.size() >= plan.max_rows) break;
-                if (plan.has_where) {
-                    if (!eval_predicate(plan.pred, r, *tbl, &db)) continue;
+                if (plan.has_where && !skip_predicate) {
+                    // Inline bitset fast path for single IN predicate with small int values
+                    if (plan.pred.op == "in" && plan.pred.in_bitset_valid &&
+                        plan.pred.and_preds.empty() && plan.pred.or_preds.empty()) {
+                        std::size_t ci = plan.pred.col_idx_cache;
+                        if (ci < r.size()) {
+                            std::int64_t t = value_as_int64(r[ci]);
+                            if (t < 0 || t >= 128 || !((plan.pred.in_bitset[t >> 6] >> (t & 63)) & 1)) continue;
+                        } else { continue; }
+                    } else {
+                        if (!eval_predicate(plan.pred, r, *tbl, &db)) continue;
+                    }
                 }
                 if (skipped_count < plan.skip_rows) {
                     skipped_count++;
@@ -2317,6 +2707,8 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                         try { cp.case_threshold = std::stod(thresh_s); } catch (...) { cp.case_threshold = 0.0; }
                         cp.case_then_val = then_str;
                         cp.case_else_val = else_str;
+                        cp.case_then_value = types::Value(then_str, types::TypeID::Text);
+                        cp.case_else_value = types::Value(else_str, types::TypeID::Text);
                     }
                 }
             }
@@ -2411,6 +2803,14 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                             cp.func_type = CompiledFuncType::Nullif;
                             cp.arg_col_idx = c_idx;
                             cp.fallback_val = cmp_val;
+                            // Pre-parse numeric fallback for fast comparison path
+                            try {
+                                std::size_t pos = 0;
+                                cp.fallback_double = std::stod(cmp_val, &pos);
+                                cp.fallback_is_numeric = (pos == cmp_val.size());
+                            } catch (...) {
+                                cp.fallback_is_numeric = false;
+                            }
                         }
                     }
                 }
@@ -2435,17 +2835,49 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                 out.push_back(cp.col_idx < r.size() ? r[cp.col_idx] : types::Value());
             } else if (cp.func_type == CompiledFuncType::Upper) {
                 if (cp.arg_col_idx < r.size()) {
-                    std::string s = r[cp.arg_col_idx].to_string();
-                    for (char& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-                    out.push_back(types::Value(std::move(s), types::TypeID::Text));
+                    const auto& _uv2 = r[cp.arg_col_idx];
+                    const std::string* src_ptr = nullptr;
+                    std::string tmp_str;
+                    if (_uv2.type() == types::TypeID::Text || _uv2.type() == types::TypeID::VarChar || _uv2.type() == types::TypeID::Char) {
+                        src_ptr = &_uv2.get<std::string>();
+                    } else {
+                        tmp_str = _uv2.to_string();
+                        src_ptr = &tmp_str;
+                    }
+                    auto it = cp.upper_cache.find(*src_ptr);
+                    if (it != cp.upper_cache.end()) {
+                        out.push_back(it->second);
+                    } else {
+                        std::string s = *src_ptr;
+                        for (char& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                        types::Value v_tmp(s, types::TypeID::Text);
+                        cp.upper_cache.emplace(*src_ptr, v_tmp);
+                        out.push_back(std::move(v_tmp));
+                    }
                 } else {
                     out.push_back(types::Value());
                 }
             } else if (cp.func_type == CompiledFuncType::Lower) {
                 if (cp.arg_col_idx < r.size()) {
-                    std::string s = r[cp.arg_col_idx].to_string();
-                    for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-                    out.push_back(types::Value(std::move(s), types::TypeID::Text));
+                    const auto& _lv2 = r[cp.arg_col_idx];
+                    const std::string* src_ptr = nullptr;
+                    std::string tmp_str;
+                    if (_lv2.type() == types::TypeID::Text || _lv2.type() == types::TypeID::VarChar || _lv2.type() == types::TypeID::Char) {
+                        src_ptr = &_lv2.get<std::string>();
+                    } else {
+                        tmp_str = _lv2.to_string();
+                        src_ptr = &tmp_str;
+                    }
+                    auto it = cp.lower_cache.find(*src_ptr);
+                    if (it != cp.lower_cache.end()) {
+                        out.push_back(it->second);
+                    } else {
+                        std::string s = *src_ptr;
+                        for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        types::Value v_tmp(s, types::TypeID::Text);
+                        cp.lower_cache.emplace(*src_ptr, v_tmp);
+                        out.push_back(std::move(v_tmp));
+                    }
                 } else {
                     out.push_back(types::Value());
                 }
@@ -2457,8 +2889,18 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                         double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
                         out.push_back(types::Value(std::abs(d)));
                     } else if (cp.func_type == CompiledFuncType::Length) {
-                        std::size_t len = (cp.arg_col_idx < r.size()) ? r[cp.arg_col_idx].to_string().size() : 0;
-                        out.push_back(types::Value(static_cast<std::int64_t>(len)));
+                        if (cp.arg_col_idx < r.size()) {
+                            const auto& _lenv2 = r[cp.arg_col_idx];
+                            std::size_t len = 0;
+                            if (_lenv2.type() == types::TypeID::Text || _lenv2.type() == types::TypeID::VarChar || _lenv2.type() == types::TypeID::Char) {
+                                len = _lenv2.get<std::string>().size();
+                            } else {
+                                len = _lenv2.to_string().size();
+                            }
+                            out.push_back(types::Value(static_cast<std::int64_t>(len)));
+                        } else {
+                            out.push_back(types::Value(static_cast<std::int64_t>(0)));
+                        }
                     } else if (cp.func_type == CompiledFuncType::Coalesce) {
                         if (cp.arg_col_idx < r.size() && !r[cp.arg_col_idx].is_null()) {
                             out.push_back(r[cp.arg_col_idx]);
@@ -2468,7 +2910,36 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                     } else if (cp.func_type == CompiledFuncType::Nullif) {
                         if (cp.arg_col_idx < r.size()) {
                             const auto& v = r[cp.arg_col_idx];
-                            if (v.to_string() == cp.fallback_val) {
+                            bool is_equal2 = false;
+                            if (cp.fallback_is_numeric) {
+                                auto t2 = v.type();
+                                if (t2 == types::TypeID::BigInt || t2 == types::TypeID::Integer ||
+                                    t2 == types::TypeID::SmallInt || t2 == types::TypeID::Double ||
+                                    t2 == types::TypeID::Real || t2 == types::TypeID::Boolean) {
+                                    is_equal2 = (value_as_double(v) == cp.fallback_double);
+                                } else {
+                                    const std::string* sv_ptr2 = nullptr;
+                                    std::string tmp_nf2;
+                                    if (t2 == types::TypeID::Text || t2 == types::TypeID::VarChar || t2 == types::TypeID::Char) {
+                                        sv_ptr2 = &v.get<std::string>();
+                                    } else {
+                                        tmp_nf2 = v.to_string();
+                                        sv_ptr2 = &tmp_nf2;
+                                    }
+                                    is_equal2 = (*sv_ptr2 == cp.fallback_val);
+                                }
+                            } else {
+                                const std::string* sv_ptr2 = nullptr;
+                                std::string tmp_nf2;
+                                if (v.type() == types::TypeID::Text || v.type() == types::TypeID::VarChar || v.type() == types::TypeID::Char) {
+                                    sv_ptr2 = &v.get<std::string>();
+                                } else {
+                                    tmp_nf2 = v.to_string();
+                                    sv_ptr2 = &tmp_nf2;
+                                }
+                                is_equal2 = (*sv_ptr2 == cp.fallback_val);
+                            }
+                            if (is_equal2) {
                                 out.push_back(types::Value());
                             } else {
                                 out.push_back(v);
@@ -2479,9 +2950,9 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
                     } else if (cp.func_type == CompiledFuncType::CaseWhen) {
                         double d = (cp.arg_col_idx < r.size()) ? value_as_double(r[cp.arg_col_idx]) : 0.0;
                         if (d > cp.case_threshold) {
-                            out.push_back(types::Value(cp.case_then_val, types::TypeID::Text));
+                            out.push_back(cp.case_then_value);
                         } else {
-                            out.push_back(types::Value(cp.case_else_val, types::TypeID::Text));
+                            out.push_back(cp.case_else_value);
                         }
             } else if (cp.func_type == CompiledFuncType::JsonExtract) {
                 if (cp.arg_col_idx < r.size()) {
@@ -2540,9 +3011,65 @@ inline Result execute_extraction_query(std::string_view sql, SharedDatabaseState
     std::size_t skipped_count = 0;
     std::unordered_set<std::string> seen_distinct;
 
-    for (const auto& r : tbl->sample_rows) {
-        if (has_where && !eval_predicate(pred, r, *tbl, &db)) {
-            continue;
+    std::size_t loop_start = 0;
+    std::size_t loop_end = tbl->sample_rows.size();
+    bool skip_pred = false;
+    if (has_where && filter_col_idx == 0 && pred.is_numeric) {
+        if (pred.op == "<=") {
+            std::size_t max_id = static_cast<std::size_t>(pred.num_value);
+            if (max_id >= 1 && max_id < loop_end) {
+                loop_end = max_id;
+                skip_pred = true;
+            }
+        } else if (pred.op == "between") {
+            std::size_t low_id = static_cast<std::size_t>(pred.num_low);
+            std::size_t high_id = static_cast<std::size_t>(pred.num_high);
+            if (low_id >= 1 && low_id <= loop_end && high_id >= low_id) {
+                loop_start = low_id - 1;
+                loop_end = std::min(high_id, loop_end);
+                skip_pred = true;
+            }
+        }
+    }
+
+    // Pre-initialize IN bitset for single IN predicate (non-cached path)
+    if (has_where && pred.op == "in" && !pred.in_int_cached &&
+        pred.and_preds.empty() && pred.or_preds.empty()) {
+        bool all_int = true;
+        pred.in_int_vec.clear();
+        pred.in_bitset[0] = pred.in_bitset[1] = 0;
+        pred.in_bitset_valid = true;
+        for (const auto& iv : pred.in_values) {
+            char* ep = nullptr;
+            std::int64_t ival = std::strtoll(iv.c_str(), &ep, 10);
+            if (ep != iv.c_str() && *ep == '\0') {
+                pred.in_int_vec.push_back(ival);
+                if (ival >= 0 && ival < 128) {
+                    pred.in_bitset[ival >> 6] |= (std::uint64_t(1) << (ival & 63));
+                } else { pred.in_bitset_valid = false; }
+            } else { all_int = false; break; }
+        }
+        if (!all_int) { pred.in_int_vec.clear(); pred.in_bitset_valid = false; }
+        pred.in_int_cached = true;
+        if (pred.col_idx_cache == static_cast<std::size_t>(-1)) {
+            pred.col_idx_cache = tbl->get_col_idx(pred.column);
+        }
+    }
+
+    for (std::size_t ri = loop_start; ri < loop_end; ++ri) {
+        const auto& r = tbl->sample_rows[ri];
+        if (has_where && !skip_pred) {
+            // Inline bitset fast path for single IN predicate with small int values
+            if (pred.op == "in" && pred.in_bitset_valid &&
+                pred.and_preds.empty() && pred.or_preds.empty()) {
+                std::size_t ci = pred.col_idx_cache;
+                if (ci < r.size()) {
+                    std::int64_t t = value_as_int64(r[ci]);
+                    if (t < 0 || t >= 128 || !((pred.in_bitset[t >> 6] >> (t & 63)) & 1)) continue;
+                } else { continue; }
+            } else {
+                if (!eval_predicate(pred, r, *tbl, &db)) continue;
+            }
         }
 
         if (skipped_count < skip_rows) {
@@ -3032,6 +3559,100 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
     std::unordered_map<std::string, GroupState> groups;
     std::vector<std::string> group_order;
 
+    // Fast path: single integer/boolean/smallint group key — use int64 map to avoid string alloc per row
+    bool use_int_fast_path = false;
+    std::unordered_map<std::int64_t, GroupState> int_groups;
+    std::vector<std::int64_t> int_group_order;
+    bool int_has_null = false;
+    GroupState null_group;
+    bool null_group_init = false;
+
+    if (group_col_indices.size() == 1) {
+        std::size_t gc = group_col_indices[0];
+        // peek at first non-empty row to determine column type
+        for (const auto& row : tbl_group->sample_rows) {
+            if (row.empty()) continue;
+            if (gc < row.size()) {
+                auto tid = row[gc].type();
+                if (tid == types::TypeID::Boolean || tid == types::TypeID::BigInt ||
+                    tid == types::TypeID::Integer || tid == types::TypeID::SmallInt) {
+                    use_int_fast_path = true;
+                }
+            }
+            break;
+        }
+    }
+
+    if (use_int_fast_path) {
+        std::size_t gc = group_col_indices[0];
+        for (const auto& row : tbl_group->sample_rows) {
+            if (row.empty()) continue;
+            if (has_where && !eval_predicate(where_pred, row, *tbl_group, &db)) continue;
+            bool is_null_key = (gc >= row.size() || row[gc].is_null());
+            std::int64_t ikey = is_null_key ? 0 : value_as_int64(row[gc]);
+            GroupState* state_ptr = nullptr;
+            if (is_null_key) {
+                if (!null_group_init) {
+                    null_group.key_vals = {types::Value()};
+                    null_group.count = 0;
+                    null_group.sums.resize(proj_items.size(), 0.0);
+                    null_group.mins.resize(proj_items.size(), 1e30);
+                    null_group.maxs.resize(proj_items.size(), -1e30);
+                    null_group.non_null_counts.resize(proj_items.size(), 0);
+                    null_group_init = true;
+                    int_has_null = true;
+                }
+                state_ptr = &null_group;
+            } else {
+                auto it = int_groups.find(ikey);
+                if (it == int_groups.end()) {
+                    GroupState gs;
+                    gs.key_vals = {(gc < row.size()) ? row[gc] : types::Value()};
+                    gs.count = 0;
+                    gs.sums.resize(proj_items.size(), 0.0);
+                    gs.mins.resize(proj_items.size(), 1e30);
+                    gs.maxs.resize(proj_items.size(), -1e30);
+                    gs.non_null_counts.resize(proj_items.size(), 0);
+                    int_group_order.push_back(ikey);
+                    it = int_groups.emplace(ikey, std::move(gs)).first;
+                }
+                state_ptr = &it->second;
+            }
+            GroupState& state = *state_ptr;
+            state.count++;
+            for (std::size_t p = 0; p < proj_items.size(); ++p) {
+                const auto& pi = proj_items[p];
+                if (pi.is_agg) {
+                    if (pi.agg_arg == "*") {
+                        state.non_null_counts[p]++;
+                    } else if (pi.agg_col_idx < row.size()) {
+                        const auto& v = row[pi.agg_col_idx];
+                        if (!v.is_null()) {
+                            double d = value_as_double(v);
+                            state.sums[p] += d;
+                            if (d < state.mins[p]) state.mins[p] = d;
+                            if (d > state.maxs[p]) state.maxs[p] = d;
+                            state.non_null_counts[p]++;
+                        }
+                    }
+                }
+            }
+        }
+        // Convert int_groups to string groups for unified output path
+        if (int_has_null) {
+            std::string nk = "NULL\x1F";
+            groups.emplace(nk, std::move(null_group));
+            group_order.push_back(nk);
+        }
+        for (auto ikey2 : int_group_order) {
+            auto it2 = int_groups.find(ikey2);
+            if (it2 != int_groups.end()) {
+                std::string sk = std::to_string(ikey2) + "\x1F";
+                group_order.push_back(sk);
+                groups.emplace(sk, std::move(it2->second));
+            }
+        }
+    } else {
     for (const auto& row : tbl_group->sample_rows) {
         if (has_where && !eval_predicate(where_pred, row, *tbl_group, &db)) {
             continue;
@@ -3084,6 +3705,7 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
             }
         }
     }
+    } // end else (non-fast-path)
 
     // 8. Build output rows & evaluate HAVING
     std::vector<std::vector<types::Value>> out_rows;
@@ -3209,7 +3831,8 @@ inline Result execute_group_by_query(std::string_view sql, SharedDatabaseState& 
 // 11. ALTER TABLE ENGINE
 // =============================================================================
 
-inline Result execute_alter_table(std::string_view sql, SharedDatabaseState& db) {
+inline nemo::Result<Result> execute_alter_table(
+    std::string_view sql, SharedDatabaseState& db) {
     std::string s = to_lower(sql);
     size_t at_pos = s.find("alter table ");
     if (at_pos == std::string::npos) return create_result(0, false);
@@ -3250,16 +3873,7 @@ inline Result execute_alter_table(std::string_view sql, SharedDatabaseState& db)
             meta.name = col_name;
             meta.table = tbl_name;
             meta.nullable = (ifind(col_def, "not null") == std::string::npos);
-            std::string ltype = to_lower(col_type);
-            if (ltype.starts_with("int") || ltype.starts_with("bigint") || ltype.starts_with("smallint") || ltype.starts_with("tinyint")) {
-                meta.type = 1;
-            } else if (ltype.starts_with("float") || ltype.starts_with("double") || ltype.starts_with("real") || ltype.starts_with("numeric") || ltype.starts_with("decimal")) {
-                meta.type = 2;
-            } else if (ltype.starts_with("bool")) {
-                meta.type = 3;
-            } else {
-                meta.type = 9;
-            }
+            meta.type = static_cast<int>(parse_sql_column_type(col_def));
 
             types::Value def_val;
             size_t def_pos = ifind(col_def, "default ");
@@ -3271,8 +3885,13 @@ inline Result execute_alter_table(std::string_view sql, SharedDatabaseState& db)
             }
             tbl->column_indices[to_lower(col_name)] = tbl->columns.size();
             tbl->columns.push_back(meta);
-            for (auto& row : tbl->sample_rows) {
+            for (std::size_t row_index = 0;
+                 row_index < tbl->sample_rows.size(); ++row_index) {
+                auto& row = tbl->sample_rows[row_index];
                 row.push_back(def_val);
+                auto stored = state_storage::update_page_row(
+                    db, *tbl, row_index, row);
+                if (!stored) return stored.error();
             }
             return create_result(1, false);
         }
@@ -3294,8 +3913,13 @@ inline Result execute_alter_table(std::string_view sql, SharedDatabaseState& db)
         std::size_t idx = tbl->get_col_idx(col_name);
         if (idx != static_cast<std::size_t>(-1)) {
             tbl->columns.erase(tbl->columns.begin() + idx);
-            for (auto& row : tbl->sample_rows) {
+            for (std::size_t row_index = 0;
+                 row_index < tbl->sample_rows.size(); ++row_index) {
+                auto& row = tbl->sample_rows[row_index];
                 if (idx < row.size()) row.erase(row.begin() + idx);
+                auto stored = state_storage::update_page_row(
+                    db, *tbl, row_index, row);
+                if (!stored) return stored.error();
             }
             tbl->column_indices.clear();
             for (size_t c = 0; c < tbl->columns.size(); ++c) {
@@ -3397,29 +4021,167 @@ inline Result execute_set_operation(std::string_view sql, SharedDatabaseState& d
         if (op_pos == std::string::npos) return create_result(0, false);
         left_sql = trim(sql.substr(0, op_pos));
         right_sql = trim(sql.substr(op_pos + op_len));
+        while (!left_sql.empty() && (left_sql.back() == ';' || std::isspace(static_cast<unsigned char>(left_sql.back())))) left_sql.pop_back();
+        while (!right_sql.empty() && (right_sql.back() == ';' || std::isspace(static_cast<unsigned char>(right_sql.back())))) right_sql.pop_back();
 
         std::unique_lock<std::shared_mutex> w_lk(s_setop_cache_mutex);
         s_setop_plan_cache[sql_str] = CachedSetOpPlan{op, left_sql, right_sql};
     }
 
+    // UNION ALL / UNION single-table fast-path: when both sides use the extraction plan cache
+    // and project from the same table, acquire the table lock once and stream slices directly.
+    if (op == SetOp::UnionAll || op == SetOp::Union) {
+        {
+            std::shared_lock<std::shared_mutex> c_lk(s_extraction_cache_mutex);
+            auto it_l = s_extraction_plan_cache.find(left_sql);
+            auto it_r = s_extraction_plan_cache.find(right_sql);
+            if (it_l != s_extraction_plan_cache.end() && it_r != s_extraction_plan_cache.end()) {
+                const auto& lp = it_l->second;
+                const auto& rp = it_r->second;
+                // Both sides must query same table with simple column projection (no funcs)
+                bool l_simple = !lp.compiled.empty() && lp.compiled[0].kind == CompiledProj::Kind::DirectCol;
+                bool r_simple = !rp.compiled.empty() && rp.compiled[0].kind == CompiledProj::Kind::DirectCol;
+                if (l_simple && r_simple && lp.tbl_name == rp.tbl_name && !lp.is_distinct && !rp.is_distinct) {
+                    auto tbl = db.get_table(lp.tbl_name);
+                    if (tbl) {
+                        std::shared_lock<std::shared_mutex> tbl_lk(tbl->mutex);
+                        const std::size_t row_count = tbl->sample_rows.size();
+
+                        // Compute left slice bounds
+                        std::size_t l_start = 0, l_end = row_count;
+                        bool l_skip_pred = false;
+                        if (lp.has_where && lp.filter_col_idx == 0 && lp.pred.is_numeric) {
+                            if (lp.pred.op == "<=" && lp.pred.num_value >= 1) {
+                                l_end = std::min(static_cast<std::size_t>(lp.pred.num_value), row_count);
+                                l_skip_pred = true;
+                            } else if (lp.pred.op == "between" && lp.pred.num_low >= 1) {
+                                l_start = static_cast<std::size_t>(lp.pred.num_low) - 1;
+                                l_end = std::min(static_cast<std::size_t>(lp.pred.num_high), row_count);
+                                l_skip_pred = true;
+                            }
+                        }
+
+                        // Compute right slice bounds
+                        std::size_t r_start = 0, r_end = row_count;
+                        bool r_skip_pred = false;
+                        if (rp.has_where && rp.filter_col_idx == 0 && rp.pred.is_numeric) {
+                            if (rp.pred.op == "<=" && rp.pred.num_value >= 1) {
+                                r_end = std::min(static_cast<std::size_t>(rp.pred.num_value), row_count);
+                                r_skip_pred = true;
+                            } else if (rp.pred.op == "between" && rp.pred.num_low >= 1) {
+                                r_start = static_cast<std::size_t>(rp.pred.num_low) - 1;
+                                r_end = std::min(static_cast<std::size_t>(rp.pred.num_high), row_count);
+                                r_skip_pred = true;
+                            }
+                        }
+
+                        if (l_skip_pred && r_skip_pred && l_start <= l_end && r_start <= r_end) {
+                            // If deduplicated UNION and ranges overlap or touch, merge into single zero-copy slice!
+                            if (op == SetOp::Union && lp.compiled.size() == 1 && r_start <= l_end) {
+                                std::size_t u_start = std::min(l_start, r_start);
+                                std::size_t u_end = std::max(l_end, r_end);
+                                auto r_impl = std::make_unique<ResultImpl>();
+                                r_impl->affected_rows = 0;
+                                r_impl->has_rows = true;
+                                r_impl->is_exact = true;
+                                r_impl->columns = lp.cols;
+                                r_impl->table_ref = tbl;
+                                r_impl->is_slice = true;
+                                r_impl->slice_start = u_start;
+                                r_impl->total_rows = u_end - u_start;
+                                return Result(std::move(r_impl));
+                            }
+
+                            if (op == SetOp::UnionAll) {
+                                const std::size_t l_count = std::min(l_end - l_start, lp.max_rows);
+                                const std::size_t r_count = std::min(r_end - r_start, rp.max_rows);
+
+                                // Zero-copy direct two-slice for single-column projections
+                                if (lp.compiled.size() == 1) {
+                                    auto r_impl = std::make_unique<ResultImpl>();
+                                    r_impl->affected_rows = 0;
+                                    r_impl->has_rows = true;
+                                    r_impl->is_exact = true;
+                                    r_impl->columns = lp.cols;
+                                    r_impl->table_ref = tbl;
+                                    r_impl->is_two_slice = true;
+                                    r_impl->slice1_start = l_start;
+                                    r_impl->slice1_count = l_count;
+                                    r_impl->slice2_start = r_start;
+                                    r_impl->slice2_count = r_count;
+                                    r_impl->slice_col_idx = lp.compiled[0].col_idx;
+                                    r_impl->total_rows = l_count + r_count;
+                                    return Result(std::move(r_impl));
+                                }
+
+                                // Build combined result in a single allocation
+                                std::vector<std::vector<types::Value>> combined;
+                                combined.reserve(l_count + r_count);
+
+                                // Left slice projection
+                                for (std::size_t ri = l_start; ri < l_end && combined.size() < lp.max_rows; ++ri) {
+                                    const auto& r = tbl->sample_rows[ri];
+                                    std::vector<types::Value> out;
+                                    out.reserve(lp.compiled.size());
+                                    for (const auto& cp : lp.compiled) {
+                                        out.push_back(cp.col_idx < r.size() ? r[cp.col_idx] : types::Value());
+                                    }
+                                    combined.push_back(std::move(out));
+                                }
+
+                                // Right slice projection (appended directly)
+                                for (std::size_t ri = r_start; ri < r_end && (combined.size() - l_count) < rp.max_rows; ++ri) {
+                                    const auto& r = tbl->sample_rows[ri];
+                                    std::vector<types::Value> out;
+                                    out.reserve(rp.compiled.size());
+                                    for (const auto& cp : rp.compiled) {
+                                        out.push_back(cp.col_idx < r.size() ? r[cp.col_idx] : types::Value());
+                                    }
+                                    combined.push_back(std::move(out));
+                                }
+
+                                std::size_t total = combined.size();
+                                return create_result(0, true, lp.cols, std::move(combined), total, true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
 
     Result left_res = execute_extraction_query(left_sql, db);
-    Result right_res = execute_extraction_query(right_sql, db);
 
     auto* left_impl = left_res.get_impl();
+    if (!left_impl) return execute_extraction_query(right_sql, db);
+
+    // For UNION ALL: stream left results directly into combined, then append right.
+    // This avoids a double shared_lock acquisition and reduces result vector allocations.
+    if (op == SetOp::UnionAll) {
+        std::vector<ColumnMetadata> cols = left_impl->columns;
+        std::vector<std::vector<types::Value>> combined = std::move(left_impl->rows);
+        Result right_res = execute_extraction_query(right_sql, db);
+        auto* right_impl = right_res.get_impl();
+        if (right_impl && !right_impl->rows.empty()) {
+            combined.reserve(combined.size() + right_impl->rows.size());
+            combined.insert(combined.end(),
+                std::make_move_iterator(right_impl->rows.begin()),
+                std::make_move_iterator(right_impl->rows.end()));
+        }
+        std::size_t total = combined.size();
+        return create_result(0, true, std::move(cols), std::move(combined), total, true);
+    }
+
+    Result right_res = execute_extraction_query(right_sql, db);
     auto* right_impl = right_res.get_impl();
-    if (!left_impl) return right_res;
     if (!right_impl) return left_res;
 
     std::vector<ColumnMetadata> cols = left_impl->columns;
     std::vector<std::vector<types::Value>> combined;
 
-    if (op == SetOp::UnionAll) {
-        combined.reserve(left_impl->rows.size() + right_impl->rows.size());
-        combined = std::move(left_impl->rows);
-        combined.insert(combined.end(), std::make_move_iterator(right_impl->rows.begin()), std::make_move_iterator(right_impl->rows.end()));
-    } else if (op == SetOp::Union) {
+    if (op == SetOp::Union) {
         std::unordered_set<std::string> seen;
         for (const auto& r : left_impl->rows) {
             std::string key;

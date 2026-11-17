@@ -16,6 +16,9 @@ void DatabaseHeader::serialize(std::span<std::byte> buffer) const noexcept {
     // 56-63: next_page_id (u64)
     // 64-71: flags (u64)
     // 72-75: checksum (u32)
+    // 76-83: checkpoint_lsn (u64)  [Phase 1]
+    // 84-91: metadata_root_page (u64)
+    // 92-127: reserved (36 bytes)
 
     std::memcpy(buffer.data(), magic.data(), 8);
     write_u32_le(buffer, 8, format_version);
@@ -27,6 +30,8 @@ void DatabaseHeader::serialize(std::span<std::byte> buffer) const noexcept {
     write_u64_le(buffer, 56, next_page_id.value());
     write_u64_le(buffer, 64, flags);
     write_u32_le(buffer, 72, checksum);
+    write_u64_le(buffer, 76, checkpoint_lsn);
+    write_u64_le(buffer, 84, metadata_root_page.value());
 }
 
 void DatabaseHeader::deserialize(std::span<const std::byte> buffer) noexcept {
@@ -40,6 +45,9 @@ void DatabaseHeader::deserialize(std::span<const std::byte> buffer) noexcept {
     next_page_id = PageID(read_u64_le(buffer, 56));
     flags = read_u64_le(buffer, 64);
     checksum = read_u32_le(buffer, 72);
+    // Phase 1: read checkpoint_lsn if buffer is large enough (graceful compat)
+    checkpoint_lsn = (buffer.size() >= 84) ? read_u64_le(buffer, 76) : 0;
+    metadata_root_page = buffer.size() >= 92 ? PageID(read_u64_le(buffer, 84)) : PageID(0);
 }
 
 } // namespace nemo::storage

@@ -64,6 +64,9 @@ public:
     bool operator!=(const Value& other) const { return !(*this == other); }
     bool operator<(const Value& other) const;
 
+    std::uint32_t enum_id() const;
+    const std::string& enum_label() const;
+
     std::string to_string() const;
 
 private:

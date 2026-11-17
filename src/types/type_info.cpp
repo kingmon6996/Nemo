@@ -26,9 +26,16 @@ constexpr std::array<TypeInfo, static_cast<std::size_t>(TypeID::Invalid) + 1> TY
     { TypeID::Interval,    "INTERVAL",    16, false, true,  true,  false, false, false, false },
     { TypeID::UUID,        "UUID",        16, false, true,  true,  true,  false, false, false },
     { TypeID::JSON,        "JSON",        0,  true,  false, false, false, false, false, true  },
+    { TypeID::JSONB,       "JSONB",       0,  true,  false, false, false, false, false, true  },
     { TypeID::DICT,        "DICT",        0,  true,  true,  true,  true,  false, false, true  },
     { TypeID::Array,       "ARRAY",       0,  true,  true,  true,  true,  false, true,  true  },
-    { TypeID::Enum,        "ENUM",        4,  false, true,  true,  true,  false, false, true  },
+    { TypeID::Enum,        "ENUM",        0,  true,  true,  true,  true,  false, false, true  },
+    { TypeID::Bit,         "BIT",         0,  true,  true,  true,  false, false, false, false },
+    { TypeID::VarBit,      "VARBIT",      0,  true,  true,  true,  false, false, false, false },
+    { TypeID::Inet,        "INET",        0,  true,  true,  true,  false, false, false, false },
+    { TypeID::Cidr,        "CIDR",        0,  true,  true,  true,  false, false, false, false },
+    { TypeID::MacAddr,     "MACADDR",     0,  true,  true,  true,  false, false, false, false },
+    { TypeID::Range,       "RANGE",       0,  true,  true,  true,  false, false, false, false },
     { TypeID::Invalid,     "INVALID",     0,  false, false, false, false, false, false, false }
 }};
 

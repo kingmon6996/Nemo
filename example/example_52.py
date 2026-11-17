@@ -28,13 +28,8 @@ def main():
     print("Nemo Example 52: Branchless Expressions & Predicates")
     print("=" * 80)
 
-    for ext in [".nm", ".nm.meta"]:
-        p = DB_NAME + ext
-        if os.path.exists(p):
-            try: os.remove(p)
-            except OSError: pass
-
-    db = nemo.Database(DB_NAME)
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
+    db = nemo.connect(DB_NAME)
     conn = db.connect_sync()
 
     print("\n[1] Setting up users & departments...")
@@ -104,12 +99,7 @@ def main():
 
     conn.close()
     db.close()
-    for ext in [".nm", ".nm.meta"]:
-        p = DB_NAME + ext
-        if os.path.exists(p):
-            try: os.remove(p)
-            except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\nExample 52 completed successfully!")
 
 if __name__ == "__main__":

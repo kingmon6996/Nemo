@@ -37,6 +37,7 @@ public:
     LogRecordType get_type() const { return m_type; }
     
     LSN get_prev_lsn() const { return m_prev_lsn; }
+    void set_prev_lsn(LSN lsn) { m_prev_lsn = lsn; }
     LSN get_undo_next_lsn() const { return m_undo_next_lsn; } // Only valid for CLR
 
     const std::vector<std::uint8_t>& get_payload() const { return m_payload; }

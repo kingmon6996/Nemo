@@ -44,6 +44,8 @@ RecordView::RecordView(std::span<const std::byte> bytes, const TupleLayout& layo
     std::uint16_t flags = read_le16(reinterpret_cast<const std::byte*>(&header->flags));
     
     m_has_nulls = (flags & RecordHeader::FLAG_HAS_NULLS) != 0;
+    m_varlen_offsets_include_nulls =
+        (flags & RecordHeader::FLAG_VARLEN_OFFSETS_INCLUDE_NULLS) != 0;
     bool has_varlen = (flags & RecordHeader::FLAG_HAS_VARLEN) != 0;
 
     std::size_t offset = sizeof(RecordHeader);
@@ -58,7 +60,14 @@ RecordView::RecordView(std::span<const std::byte> bytes, const TupleLayout& layo
     m_var_offset_array = m_fixed_data_offset + layout.fixed_part_size();
     
     if (has_varlen) {
-        m_var_data_offset = m_var_offset_array + (layout.variable_count() * sizeof(std::uint32_t));
+        std::size_t offset_count = layout.variable_count();
+        if (!m_varlen_offsets_include_nulls) {
+            offset_count = 0;
+            for (std::size_t i = 0; i < layout.column_count(); ++i) {
+                if (layout.column(i).fixed_length == 0 && !is_null(i)) ++offset_count;
+            }
+        }
+        m_var_data_offset = m_var_offset_array + offset_count * sizeof(std::uint32_t);
     } else {
         m_var_data_offset = m_var_offset_array;
     }
@@ -90,7 +99,8 @@ types::Value RecordView::field(std::size_t index) const {
         // Variable length. Find the index in var array.
         std::uint32_t var_idx = 0;
         for (std::size_t i = 0; i < index; ++i) {
-            if (m_layout.column(i).fixed_length == 0 && !is_null(i)) {
+            if (m_layout.column(i).fixed_length == 0 &&
+                (m_varlen_offsets_include_nulls || !is_null(i))) {
                 var_idx++;
             }
         }
@@ -103,14 +113,11 @@ types::Value RecordView::field(std::size_t index) const {
         
         std::uint32_t next_var_idx = var_idx + 1;
         
-        // Find the next non-null variable field
         for (std::size_t i = index + 1; i < m_layout.column_count(); ++i) {
-             if (m_layout.column(i).fixed_length == 0 && !is_null(i)) {
+             if (m_layout.column(i).fixed_length == 0 &&
+                 (m_varlen_offsets_include_nulls || !is_null(i))) {
                  next_offset = read_le32(array_ptr + next_var_idx * 4);
                  break;
-             }
-             if (m_layout.column(i).fixed_length == 0) {
-                 next_var_idx++;
              }
         }
         
@@ -135,7 +142,8 @@ types::ValueView RecordView::field_view(std::size_t index) const {
         // Variable length. Find the index in var array.
         std::uint32_t var_idx = 0;
         for (std::size_t i = 0; i < index; ++i) {
-            if (m_layout.column(i).fixed_length == 0 && !is_null(i)) {
+            if (m_layout.column(i).fixed_length == 0 &&
+                (m_varlen_offsets_include_nulls || !is_null(i))) {
                 var_idx++;
             }
         }
@@ -147,12 +155,10 @@ types::ValueView RecordView::field_view(std::size_t index) const {
         std::uint32_t next_var_idx = var_idx + 1;
         
         for (std::size_t i = index + 1; i < m_layout.column_count(); ++i) {
-             if (m_layout.column(i).fixed_length == 0 && !is_null(i)) {
+             if (m_layout.column(i).fixed_length == 0 &&
+                 (m_varlen_offsets_include_nulls || !is_null(i))) {
                  next_offset = read_le32(array_ptr + next_var_idx * 4);
                  break;
-             }
-             if (m_layout.column(i).fixed_length == 0) {
-                 next_var_idx++;
              }
         }
         

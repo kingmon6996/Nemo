@@ -11,11 +11,11 @@ TablePage::TablePage(PageHandle handle) : m_handle(std::move(handle)) {}
 
 void TablePage::init() {
     auto& page = m_handle.get_mut();
-    (void)page;
-    
-    // Ensure generic page header knows it's a table page (if you add types later)
-    // auto* gen_header = reinterpret_cast<PageHeader*>(page.data());
-    // gen_header->type = PageType::Table;
+    auto generic_header = page.read_header();
+    generic_header.page_type = PageType::Table;
+    generic_header.header_version = 1;
+    generic_header.payload_size = static_cast<std::uint32_t>(page.payload_span().size());
+    page.write_header(generic_header);
     
     auto* tbl_header = header();
     tbl_header->next_page_id = PageID{};
@@ -24,6 +24,7 @@ void TablePage::init() {
     tbl_header->free_space_lower_bound = sizeof(PageHeader) + sizeof(TablePageHeader);
     tbl_header->free_space_upper_bound = static_cast<std::uint32_t>(page_size());
     tbl_header->live_record_count = 0;
+    m_handle.mark_dirty();
 }
 
 std::size_t TablePage::page_size() const {

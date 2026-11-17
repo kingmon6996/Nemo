@@ -4,6 +4,7 @@
 #include "nemo/core/result.hpp"
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <span>
 
 namespace nemo::storage {
@@ -33,6 +34,7 @@ public:
 
 private:
     mutable std::fstream m_file;
+    mutable std::mutex m_mutex;
     bool m_is_open{false};
 };
 

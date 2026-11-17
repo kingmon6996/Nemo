@@ -265,32 +265,24 @@ All tables, schemas, B+ Tree indexes, and slotted data pages are stored inside a
 - **Zero Sidecar Clutter**: No auxiliary `.nm.meta` files are generated.
 - Database metadata, page counts, and free lists are serialized directly into Page 0 (Database Header Page).
 
-### 4096-Byte Slotted Page Anatomy
+### 8 KB Page Anatomy
 
-Each page is exactly 4096 bytes (4 KB), aligned to OS page cache boundaries and SSD storage sectors:
+Each database page is 8192 bytes. A page starts with the serialized 36-byte
+`PageHeader`; the remaining bytes contain page-type-specific data. Table pages
+store slotted records, allowing a record's payload to move during compaction
+without changing its page/slot identifier.
 
 ```
-+-------------------------------------------------------------------+
-| PAGE HEADER (64 Bytes)                                            |
-| - page_id (4B)            | lsn (8B)                              |
-| - page_type (2B)          | slot_count (2B)                       |
-| - free_space_lower (2B)   | free_space_upper (2B)                 |
-| - prev_page_id (4B)       | next_page_id (4B)                     |
-| - crc32_checksum (4B)     | reserved (34B)                        |
-+-------------------------------------------------------------------+
-| SLOT DIRECTORY (Grows Downward from byte 64)                      |
-| - Slot 0: offset (2B), length (2B)                                |
-| - Slot 1: offset (2B), length (2B)                                |
-| - Slot N: offset (2B), length (2B)                                |
-|                             │                                     |
-|                             ▼                                     |
-|                     FREE SPACE WINDOW                             |
-|                             ▲                                     |
-|                             │                                     |
-| - Record 1 (Packed Payload Bytes)                                 |
-| - Record 0 (Packed Payload Bytes)                                 |
-| TUPLE STORAGE AREA (Grows Upward from byte 4095)                  |
-+-------------------------------------------------------------------+
++--------------------------------------------------+
+| PAGE HEADER (36 bytes)                           |
+| page ID, type, flags/version, LSN, generation,   |
+| payload size, checksum                           |
++--------------------------------------------------+
+| PAGE-TYPE-SPECIFIC DATA                          |
+| Table pages: slotted records and free space      |
+|                                                  |
+| Total page size: 8192 bytes                      |
++--------------------------------------------------+
 ```
 
 - **Slot Addressing**: Records are addressed via Record IDs (`RID = page_id : slot_id`). Slotted pages allow records to be defragmented and shifted in memory without changing external index pointers.
@@ -314,7 +306,7 @@ Indexes in Nemo are implemented as disk-backed $B^+$ Trees:
 ## 5. Memory Management & Buffer Pool
 
 ### Frame Management & Buffer Latching
-The Buffer Pool maintains an in-memory array of 4096-byte frames:
+The Buffer Pool maintains an in-memory array of 8192-byte frames:
 - **Page Hash Table**: Maps `page_id` to `frame_id` in $O(1)$ time.
 - **Pin Count Tracking**: Pin counts ensure that active query engines cannot have their memory frames evicted while reading or writing.
 - **Dirty Bit Tracking**: Tracks modified pages that must be written to disk before frame reuse.
@@ -476,3 +468,546 @@ The Checkpoint Manager periodically merges committed WAL changes into the main `
 - **[SQL Syntax & Grammar](docs/sql.md)**: DDL, DML, auto-increment sequences, and Cost-Based Optimizer commands.
 - **[Synchronous Python Connector](docs/syncconnector.md)** & **[Asynchronous Python Connector](docs/asyncconnector.md)**: Python client references.
 
+
+
+---
+
+## Storage Layout (Phase 1)
+
+> [!NOTE]
+> This section documents the on-disk layout established in Phase 1 and used by
+> the Phase 2 buffer-pool SQL row path. WAL durability, crash recovery, and
+> concurrent-reader/writer guarantees are separate, incomplete phases.
+
+### Folder Structure
+
+Every Nemo database lives in a dedicated folder inside `.nemo/` relative to your current working directory. There are no custom paths, no file extensions to manage, and no sidecar files:
+
+```
+<cwd>/
+└── .nemo/
+    └── <name>/
+        ├── data.nm      ← Main data file: 128-byte DB header + 8 KB slotted pages
+        ├── wal/         ← WAL segment files (Phase 3+)
+        └── lock         ← Process-level exclusive lock (Phase 5+)
+```
+
+### Connecting
+
+```python
+import nemo
+
+# Creates .nemo/mydb/ if it does not exist; opens it if it does
+db = nemo.connect("mydb")
+
+# Optional: cap the buffer pool at 512 MB
+db = nemo.connect("mydb", buffer_pool_mb=512)
+```
+
+`nemo.connect()` accepts **only** `name` and `buffer_pool_mb`. No `path=`, no `timeout=`.
+
+### Name Validation
+
+The Python layer validates the name before touching the filesystem:
+
+| Check | Rule |
+|:---|:---|
+| Non-empty | `ValueError` if empty |
+| No dots | Rejects `mydb.nm`, `db.v2`, etc. |
+| No path separators | Rejects `/`, `\` in the name |
+| No `..` | Directory traversal is not allowed |
+| No `:memory:` | Nemo is strictly disk-primary |
+
+### Database Header Layout (`data.nm`, bytes 0–127)
+
+The first 128 bytes of `data.nm` are the database header, stored on Page 0:
+
+| Bytes | Field | Type | Description |
+|:---|:---|:---|:---|
+| 0–7 | `magic` | `char[8]` | `"NEMODB01"` — identifies a Nemo data file |
+| 8–11 | `format_version` | `u32` | Schema format version |
+| 12–15 | `page_size` | `u32` | Page size in bytes (default 8192) |
+| 16–31 | `database_id` | `byte[16]` | UUID uniquely identifying this database |
+| 32–39 | `creation_timestamp` | `u64` | Unix epoch (seconds) of database creation |
+| 40–47 | `catalog_root_page` | `u64` | Page ID of the catalog B-tree root |
+| 48–55 | `free_page_root` | `u64` | Page ID of the free-page list root |
+| 56–63 | `next_page_id` | `u64` | Next page ID to allocate |
+| 64–71 | `flags` | `u64` | Feature flags bitfield |
+| 72–75 | `checksum` | `u32` | CRC32C of bytes 0–71 |
+| **76–83** | **`checkpoint_lsn`** | **`u64`** | **LSN of last WAL checkpoint flushed to data.nm** |
+| 84–127 | *(reserved)* | — | Reserved for future fields (zeroed) |
+
+`checkpoint_lsn` is 0 until the WAL is wired up in Phase 3. Reading a header with fewer than 84 bytes defaults it to 0 for backward compatibility.
+
+### Path Resolution (C++ side)
+
+`SharedDatabaseState::db_path` now points to `.nemo/<name>/data.nm`. Helper methods derived from it:
+
+```cpp
+// .nemo/<name>/wal/
+std::string get_wal_dir() const;
+
+// .nemo/<name>/lock
+std::string get_lock_path() const;
+```
+
+Both use `std::filesystem::path` for portable path construction.
+
+
+---
+
+## Buffer Pool and SQL Row Persistence (Phases 1–2)
+
+> [!NOTE]
+> SQL table records are persisted in slotted pages accessed through the buffer
+> pool. The decoded `sample_rows` are a query working cache, not the persisted
+> source of truth. Full scans and non-key predicates may hydrate that cache;
+> eligible cold `id = N` reads fetch a single record directly. Persisted
+> secondary indexes and concurrent-reader/writer guarantees remain later-phase
+> work.
+
+### RAM Auto-detection
+
+```
+nemo.connect("mydb")                     # auto: 1/4 of available RAM
+nemo.connect("mydb", buffer_pool_mb=512) # explicit: 512 MB
+```
+
+The auto-detection sequence (C++, `database.cpp`):
+
+| Platform | API used |
+|:---|:---|
+| Windows | `GlobalMemoryStatusEx` → `ullAvailPhys` |
+| macOS | `sysctl vm.page_free_count × hw.pagesize` |
+| Linux | `sysinfo.freeram × mem_unit` |
+| Fallback | `4 × DEFAULT_BUFFER_POOL_SIZE` (256 MB) |
+
+The result is clamped to **[32 MB, 8 GB]**.
+
+### Frame Count
+
+```
+frame_count = pool_bytes / page_size     (minimum 32 frames)
+```
+
+At 8 KB pages and 512 MB pool: 65,536 frames.
+
+### Construction path (`Database::open`)
+
+```
+1. compute_buffer_pool_bytes(override_mb)   → pool_bytes
+2. bytes_to_frame_count(pool_bytes, 8192)   → frame_count
+3. DiskManager::open/create(data.nm, cfg)   → disk_manager
+4. WALManager(wal_dir, DurabilityMode::Normal)
+5. BufferPool(frame_count, disk_manager, wal_manager)
+```
+
+File-backed database open fails if the WAL manager cannot be initialized.
+Having the manager available does not by itself mean SQL row mutations are
+fully WAL-logged or crash-recoverable.
+
+### Close / Flush path
+
+```
+Database::close()
+  → WAL flush
+  → shared_state->persist_state()   (persist page-backed database state)
+  → buffer_pool->flush_all()        (flush dirty 8 KB pages)
+  → worker_pool->shutdown()
+```
+
+`db.flush()` flushes the WAL before persisting state and dirty pages, then
+flushes the data file. Checkpoint-specific recovery guarantees remain Phase 4
+work.
+
+### `DatabaseConfig.buffer_pool_size`
+
+The field changed from a fixed 1 GB default to **`0` (auto)**:
+
+```cpp
+struct DatabaseConfig {
+    std::size_t buffer_pool_size{0};  // 0 = auto-detect
+    // ...
+};
+```
+
+Python passes `buffer_pool_mb * 1024 * 1024` as bytes, or `0` for auto.
+
+### Buffer Pool Statistics
+
+```python
+stats = db.statistics()
+print(stats.buffer_hits)    # cache hits since open
+print(stats.buffer_misses)  # cache misses (disk reads)
+```
+
+Both fields are populated from `BufferPool::stats()` atomics.
+
+
+---
+
+## Write-Ahead Log (Phase 3)
+
+`DiskManager::write_page()` logs a full before/after image for each persistent
+page mutation. It flushes the image before writing the data page, then stamps
+non-header pages with that record's LSN and recalculates the checksum.
+
+### Construction (`Database::open`)
+
+```
+Database::open(path, config)
+  → WALManager(wal_dir, DurabilityMode::Normal)
+  → BufferPool(frame_count, disk_manager, wal_manager)
+  → disk_manager->set_wal_manager(wal_manager.get())
+  → shared_state->wal_manager = wal_manager.get()
+```
+
+For `.nemo/<name>/data.nm`, the WAL directory is `.nemo/<name>/wal/`.
+Standalone database files use a sibling `<filename>.wal` directory.
+
+### Write Path (SQL autocommit and explicit commit)
+
+```
+SQL mutation
+  → TxnBegin
+  → mutate working SQL state
+  → persist page-backed state under transaction WAL context
+  → PageWrite(before image, after image); flush WAL; write page with page LSN
+  → TxnCommit; flush commit LSN
+  → return to caller
+```
+
+Autocommit DML and supported DDL use implicit transactions. Explicit
+transactions persist their page changes before appending the commit marker.
+WAL and data-write errors are returned to the operation caller.
+
+### Close / Flush path
+
+```
+Database::close()  / flush()
+  1. wal_manager->flush()          durable flush; errors are returned
+  2. persist_state()               serialize page-backed database state
+  3. buffer_pool->flush_all()      each dirty page is WAL-logged before data write
+  4. worker_pool->shutdown()
+```
+
+### Transaction IDs
+
+`SharedDatabaseState::next_txn_id` is an atomic `uint64_t` counter initialized
+above the maximum transaction ID in the existing WAL. A transaction's
+`PageWrite`, commit, and abort records share its ID and previous-LSN chain.
+
+### WAL-before-Data
+
+The buffer pool first ensures an existing page LSN is durable. The disk manager
+then appends and flushes the new page image, stamps the page, and writes it.
+Fresh database bootstrap occurs before WAL setup and contains no user data.
+
+### Group Commit (double-buffer design)
+
+```
+Thread A: append(record_A) → writes to m_buffer
+Thread B: append(record_B) → writes to m_buffer
+flush_up_to(lsn) →
+    wait up to 5 ms in Normal mode, unless the 4 MB batch threshold is reached
+    swap buffers under append_mutex
+    write and durably flush the detached batch under flush_mutex
+    advance m_flushed_lsn only to that batch's final LSN
+```
+
+### Failure Tolerance
+
+If WAL construction or a WAL write/flush fails for a file-backed database,
+open or the affected operation returns an I/O error instead of continuing
+without WAL.
+
+---
+
+## Crash Recovery (Phase 4)
+
+Recovery runs before SQL metadata is loaded from every existing file-backed
+database. Failures are returned from `Database::open()`; the engine does not
+start in degraded mode.
+
+### Construction Order inside `Database::open()`
+
+```
+TransactionManager(lock_manager=nullptr, wal_manager)   ← Phase 5 wires lock_manager
+CheckpointManager(wal_manager, txn_manager, buffer_pool, db_dir)
+RecoveryManager(wal_manager, checkpoint_manager, buffer_pool, wal_dir)
+  └─ if (is_existing_db) recovery_manager->recover()
+       ├─ phase_analysis()
+       ├─ phase_redo()
+       └─ phase_undo()
+     → reload recovered database header/free-page bitmap
+     → load page-backed SQL state
+```
+
+Current recovery scans the complete WAL. It redoes page-image and CLR after
+images in LSN order, skipping non-header pages whose page LSN is already
+current. It undoes loser transactions by following their previous-LSN chains,
+writing a durable CLR before restoring a page before-image.
+
+### CheckpointManager — `checkpoint()` path
+
+```cpp
+// Database::checkpoint()
+checkpoint_manager->perform_checkpoint()   // Begin→flush dirty pages→write master.nm→End
+auto& hdr = disk_manager->get_database_header();
+hdr.checkpoint_lsn = wal_manager->get_flushed_lsn().value();
+// then flush() → wal flush → buffer pool flush_all
+```
+
+`master.nm` layout (16 bytes):
+```
+0–7:  checkpoint_lsn  (uint64 LE)
+8–15: timestamp       (uint64 LE, Unix seconds)
+```
+
+Recovery does not yet use this master record to bound the WAL scan, and old
+segments are not truncated.
+
+### `DatabaseStatistics.recovery_complete`
+
+Exposed to Python via `conn._db.statistics()["recovery_complete"]`.
+`True` = startup recovery completed (or the database was fresh). Recovery
+failure prevents the database from opening.
+
+Checkpoint-aware analysis/truncation and process-crash testing remain
+incomplete. Close-and-reopen recovery tests do not substitute for process
+termination tests.
+
+---
+
+## Safe Concurrency (Phase 5)
+
+> Phase 5 wires per-row atomic visibility flags, per-table writer serialization,
+> and an advisory process lock file. No MVCC — Read-Committed with 1-byte flags.
+
+### Row Visibility Flags
+
+`TableData` gains a `std::vector<std::atomic<uint8_t>> row_flags` parallel to `sample_rows`.
+
+```
+Bit 0 (0x01)  committed  — reader-visible
+Bit 1 (0x02)  deleted    — soft-deleted, reader-invisible
+```
+
+`push_row(row, committed)` appends atomically:
+```cpp
+// Auto-commit path: committed=true  → flags[idx] = 0x01
+// Explicit txn:    committed=false → flags[idx] = 0x00 (pending)
+```
+
+Readers call `is_row_visible(idx)`:
+```cpp
+uint8_t f = row_flags[idx].load(std::memory_order_acquire);
+return (f & 0x01) && !(f & 0x02);
+```
+
+### COMMIT / ROLLBACK Stamping
+
+`ConnectionImpl::pending_row_starts` snapshots per-table row counts at `BEGIN`:
+
+```
+BEGIN     → pending_row_starts[tbl] = tbl->sample_rows.size()
+COMMIT    → commit_rows(from_idx)   // flags[from..] |= 0x01  (release semantics)
+ROLLBACK  → delete_rows(from_idx)   // flags[from..] |= 0x02  (release semantics)
+```
+
+Both operations use `fetch_or` with `std::memory_order_release` so the flag update
+is immediately visible to any reader doing `load(acquire)`.
+
+### Locking Hierarchy
+
+```
+db_mutex (shared_mutex)       ← catalog-level: CREATE/DROP TABLE
+  tbl->mutex (shared_mutex)   ← row-level: readers=shared, writers=unique
+    tbl->write_mutex (mutex)  ← serializes concurrent INSERT writers
+```
+
+Write path holds `tbl->mutex` (unique) for the duration of a single `push_row()` call — typically < 1 µs.
+
+### persist_state() Filtering
+
+Only `is_row_visible(i)` rows are written to `data.nm`. Uncommitted and soft-deleted rows never reach disk, so they cannot reappear after a crash or reopen.
+
+On load, all restored rows are stamped `flags = 0x01` (committed).
+
+### Process Lock File
+
+`Database.__init__` writes `.nemo/<name>/lock` containing the PID using:
+- **Windows**: `msvcrt.locking(fd, LK_NBLCK, 1)`
+- **Unix**: `fcntl.flock(fd, LOCK_EX | LOCK_NB)`
+
+`Database.close()` releases and removes the lock file. Failure to acquire the lock is non-fatal — the database still opens (advisory semantics).
+
+
+---
+
+## B+ Tree Index (Phase 6)
+
+### Overview
+
+Phase 6 adds a **secondary index layer** that converts equality `SELECT … WHERE col = val`
+queries from O(N) full table scans into O(log N) ordered map lookups.
+
+The in-memory index implementation is `InMemoryIndex` — a `std::map`-backed structure
+in `src/api/api_internal.hpp`.  The existing B+ Tree page-aware headers at
+`include/nemo/index/bplus_tree.hpp` are reserved for the future disk-primary engine path.
+
+---
+
+### `ValueLess` Comparator
+
+```cpp
+struct ValueLess {
+    bool operator()(const types::Value& a, const types::Value& b) const;
+};
+```
+
+Provides total ordering for `std::map<types::Value, …>`:
+- Numeric values: compared as `double` via `as_double()`
+- All other values: compared as `to_string()` lexicographically
+
+---
+
+### `InMemoryIndex` Struct
+
+```
+entries   : std::map<Value, vector<row_idx>, ValueLess>
+mutex     : mutable shared_mutex  (reader-writer protection)
+col_idx   : zero-based column index into TableData::sample_rows
+is_unique : set by CREATE UNIQUE INDEX
+```
+
+| Method | Complexity | Description |
+|--------|-----------|-------------|
+| `rebuild(tbl)` | O(N) | Full rebuild from committed visible rows |
+| `on_insert(key, ri)` | O(log N) | Append row index to sorted map |
+| `on_delete(key, ri)` | O(log N) | Remove specific row index |
+| `lookup(key)` | O(log N) | Shared-locked point lookup |
+
+---
+
+### `SharedDatabaseState` Index Registry
+
+```cpp
+unordered_map<string, shared_ptr<InMemoryIndex>> indexes;
+
+get_index(tbl_lower, col_lower)  → InMemoryIndex* or nullptr
+index_on_insert(tbl_lower, row_idx, row)  → iterate indexes, call on_insert()
+index_on_delete(tbl_lower, row_idx, row)  → iterate indexes, call on_delete()
+```
+
+All five INSERT code paths in `connection.cpp` call `index_on_insert()` immediately
+after `push_row()` returns, passing the new row's slot index
+(`tbl->sample_rows.size() - 1`).
+
+---
+
+### SELECT WHERE Fast Path
+
+```
+execute(sql)
+  → parse_simple_where()   →  {column, op, value}
+  → op == "=" ?
+      → get_index(tbl, col)
+          → InMemoryIndex::lookup(key)   O(log N)
+          → filter by is_row_visible()
+          → return matching rows
+      → else: execute_extraction_query() O(N)
+```
+
+The fast path activates only for `SELECT * FROM tbl WHERE col = val` patterns
+where the predicate column is not the primary-key `id` column (which already has
+its own direct-offset lookup path).
+
+---
+
+### DELETE Invalidation
+
+| Scenario | Action |
+|----------|--------|
+| `DELETE FROM tbl` (no WHERE) | Clear `entries` map of all indexes for the table |
+| `DELETE WHERE id = N` | Rebuild all table indexes (slot cleared in-place) |
+| `DELETE WHERE col = val` | Rebuild all table indexes after `erase()` compacts rows |
+
+Rebuild is chosen over surgical `on_delete` because `std::remove_if` + `erase`
+shifts all subsequent row indices, making stored positions stale.
+
+---
+
+### DDL Integration
+
+| Statement | Action |
+|-----------|--------|
+| `CREATE INDEX` | Build `InMemoryIndex`, `rebuild()` from existing rows, register in `indexes` map |
+| `CREATE UNIQUE INDEX` | Same, with `is_unique = true` |
+| `DROP INDEX` | Erase from `indexes` map and from `secondary_indexes` name set |
+| `DROP TABLE` | Erase all `InMemoryIndex` entries whose `table_name` matches |
+
+
+---
+
+## SIMD Column Decode (Phase 7)
+
+### Overview
+
+Phase 7 replaces the scalar accumulation loop inside
+`execute_vectorized_aggregates()` with a two-stage **decode + accumulate**
+pipeline that exploits CPU vector units (AVX2, SSE4.1, or scalar fallback).
+
+---
+
+### `simd_decode_column()`
+
+```
+rows (column-major access, row-major storage)
+  ↓  skip nulls
+out[]  — contiguous double[]  (cache-friendly)
+```
+
+Iterates `sample_rows`, tests each `Value` for NULL, and writes
+`value_as_double(v)` into a dense output buffer.  No SIMD here — the NULL
+branch prevents vectorization of the extraction step itself.
+
+---
+
+### `simd_aggregate_doubles()`
+
+```
+double* data, size_t n
+  → AVX2 path (4×double/iter):   _mm256_add_pd, _mm256_min_pd, _mm256_max_pd
+  → SSE4 path (2×double/iter):   _mm_add_pd, _mm_min_pd, _mm_max_pd
+  → scalar path (1×double/iter): fallback
+  → horizontal reduction + scalar tail
+  → { sum, min, max }
+```
+
+The macro `NEMO_HAVE_AVX2` / `NEMO_HAVE_SSE4` is set by the compiler flags
+`-mavx2` / `-msse4.1` during the build — no runtime CPU detection is needed.
+
+---
+
+### Integration
+
+| Code path | Location |
+|-----------|----------|
+| Cached plan hot path | `execute_vectorized_aggregates()` → cached branch |
+| Cold plan path | `execute_vectorized_aggregates()` → compilation + first run |
+
+`COUNT(*)` is unaffected — it reads `tbl->total_rows` directly (O(1), no decode).
+
+---
+
+### Build Flags
+
+```
+GCC/Clang:  -mavx2        → enables AVX2 path
+            -msse4.1      → enables SSE4 path
+MSVC:       /arch:AVX2    → enables AVX2 path
+            /arch:SSE2    → SSE4 (default on modern MSVC)
+```
+
+The scalar path compiles and produces correct results on any target.

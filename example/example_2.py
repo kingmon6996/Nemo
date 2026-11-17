@@ -20,12 +20,10 @@ async batch inserts, async streaming fetches, and async connection pooling.
 """
 
 import asyncio
-import os
 import time
 import nemo
 
 DB_NAME = "example2_async_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 async def async_worker_insert(pool, worker_id: int, num_records: int):
     """Simulates a concurrent async worker inserting records via connection pool."""
@@ -101,10 +99,7 @@ async def main():
                 print(f"    - ID: {r[0]} | Device: {r[1]:<15} | Temp: {r[2]:.1f}°C | Humidity: {r[3]:.1f}%")
 
     # Clean up local database file
-    if os.path.exists(DB_FILE):
         try:
-            os.remove(DB_FILE)
-            print(f"\n[Cleanup] Cleaned up temporary database: {DB_FILE}")
         except OSError:
             pass
 

@@ -3,6 +3,7 @@
 #include "nemo/types/dict.hpp"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <bit>
 
@@ -37,6 +38,122 @@ T read_le(const std::uint8_t* ptr) {
         }
     }
     return val;
+}
+
+void write_json_node(std::vector<std::uint8_t>& bytes, const JsonNode& node) {
+    bytes.push_back(static_cast<std::uint8_t>(node.type()));
+    switch (node.type()) {
+        case JsonNode::Type::Null:
+            break;
+        case JsonNode::Type::Boolean:
+            bytes.push_back(node.get_boolean() ? 1 : 0);
+            break;
+        case JsonNode::Type::Number:
+            write_le(bytes, node.get_number());
+            break;
+        case JsonNode::Type::String: {
+            const auto& string = node.get_string();
+            if (string.size() > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::length_error("JSON string exceeds serialization limit");
+            }
+            write_le<std::uint32_t>(bytes, static_cast<std::uint32_t>(string.size()));
+            bytes.insert(bytes.end(), string.begin(), string.end());
+            break;
+        }
+        case JsonNode::Type::Array: {
+            const auto& array = node.get_array();
+            if (array.size() > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::length_error("JSON array exceeds serialization limit");
+            }
+            write_le<std::uint32_t>(bytes, static_cast<std::uint32_t>(array.size()));
+            for (const auto& item : array) write_json_node(bytes, item);
+            break;
+        }
+        case JsonNode::Type::Object: {
+            const auto& object = node.get_object();
+            if (object.size() > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::length_error("JSON object exceeds serialization limit");
+            }
+            write_le<std::uint32_t>(bytes, static_cast<std::uint32_t>(object.size()));
+            for (const auto& [key, value] : object) {
+                if (key.size() > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::length_error("JSON object key exceeds serialization limit");
+                }
+                write_le<std::uint32_t>(bytes, static_cast<std::uint32_t>(key.size()));
+                bytes.insert(bytes.end(), key.begin(), key.end());
+                write_json_node(bytes, value);
+            }
+            break;
+        }
+    }
+}
+
+std::string read_json_string(const std::uint8_t* bytes, std::size_t size,
+                             std::size_t& offset) {
+    if (offset + sizeof(std::uint32_t) > size) {
+        throw std::runtime_error("Buffer too small for JSON string length");
+    }
+    const auto length = read_le<std::uint32_t>(bytes + offset);
+    offset += sizeof(std::uint32_t);
+    if (length > size - offset) throw std::runtime_error("Buffer too small for JSON string");
+    std::string result(reinterpret_cast<const char*>(bytes + offset), length);
+    offset += length;
+    return result;
+}
+
+JsonNode read_json_node(const std::uint8_t* bytes, std::size_t size,
+                        std::size_t& offset) {
+    if (offset >= size) throw std::runtime_error("Buffer too small for JSON node");
+    const auto type = static_cast<JsonNode::Type>(bytes[offset++]);
+    switch (type) {
+        case JsonNode::Type::Null:
+            return JsonNode();
+        case JsonNode::Type::Boolean:
+            if (offset >= size) throw std::runtime_error("Buffer too small for JSON boolean");
+            return JsonNode(bytes[offset++] != 0);
+        case JsonNode::Type::Number:
+            if (sizeof(double) > size - offset) {
+                throw std::runtime_error("Buffer too small for JSON number");
+            }
+            {
+                const auto number = read_le<double>(bytes + offset);
+                offset += sizeof(double);
+                return JsonNode(number);
+            }
+        case JsonNode::Type::String:
+            return JsonNode(read_json_string(bytes, size, offset));
+        case JsonNode::Type::Array: {
+            if (sizeof(std::uint32_t) > size - offset) {
+                throw std::runtime_error("Buffer too small for JSON array size");
+            }
+            const auto count = read_le<std::uint32_t>(bytes + offset);
+            offset += sizeof(std::uint32_t);
+            if (count > size - offset) throw std::runtime_error("Invalid JSON array size");
+            std::vector<JsonNode> array;
+            array.reserve(count);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                array.push_back(read_json_node(bytes, size, offset));
+            }
+            return JsonNode(std::move(array));
+        }
+        case JsonNode::Type::Object: {
+            if (sizeof(std::uint32_t) > size - offset) {
+                throw std::runtime_error("Buffer too small for JSON object size");
+            }
+            const auto count = read_le<std::uint32_t>(bytes + offset);
+            offset += sizeof(std::uint32_t);
+            if (count > (size - offset) / (sizeof(std::uint32_t) + 1)) {
+                throw std::runtime_error("Invalid JSON object size");
+            }
+            std::map<std::string, JsonNode> object;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                auto key = read_json_string(bytes, size, offset);
+                object.emplace(std::move(key), read_json_node(bytes, size, offset));
+            }
+            return JsonNode(std::move(object));
+        }
+    }
+    throw std::runtime_error("Invalid JSON node type");
 }
 
 } // namespace
@@ -108,14 +225,14 @@ std::vector<std::uint8_t> TypeSerializer::serialize(const Value& value) {
         }
         case TypeID::JSON: {
             const auto& j = value.get<Json>();
-            // V1: serialize as string for simplicity.
-            std::string s = j.to_string();
-            res.insert(res.end(), s.begin(), s.end());
+            write_json_node(res, j.root());
             break;
         }
         case TypeID::Array: {
             const auto& arr = value.get<Array>();
             write_le<std::uint32_t>(res, static_cast<std::uint32_t>(arr.size()));
+            write_le<std::uint16_t>(res, 0xffff);
+            write_le<std::uint16_t>(res, static_cast<std::uint16_t>(arr.element_type()));
             for (std::size_t i = 0; i < arr.size(); ++i) {
                 const auto& elem = arr.at(i);
                 std::uint16_t tid = static_cast<std::uint16_t>(elem.type());
@@ -150,7 +267,13 @@ std::vector<std::uint8_t> TypeSerializer::serialize(const Value& value) {
             res.insert(res.end(), s.begin(), s.end());
             break;
         }
-        case TypeID::Enum:
+        case TypeID::Enum: {
+            write_le<std::uint32_t>(res, value.enum_id());
+            const auto& label = value.enum_label();
+            write_le<std::uint32_t>(res, static_cast<std::uint32_t>(label.size()));
+            res.insert(res.end(), label.begin(), label.end());
+            break;
+        }
         case TypeID::Bit:
         case TypeID::VarBit:
         case TypeID::Inet:
@@ -213,7 +336,8 @@ Value TypeSerializer::deserialize(const std::vector<std::uint8_t>& bytes, TypeID
         case TypeID::Timestamp:
         case TypeID::TimestampTZ:
             if (size < 8) throw std::runtime_error("Buffer too small");
-            return Value(Timestamp(read_le<std::int64_t>(ptr)));
+            return Value(Timestamp(read_le<std::int64_t>(ptr)),
+                         type == TypeID::TimestampTZ);
         case TypeID::Interval:
             if (size < 16) throw std::runtime_error("Buffer too small");
             return Value(Interval(read_le<std::int32_t>(ptr), read_le<std::int32_t>(ptr+4), read_le<std::int64_t>(ptr+8)));
@@ -224,12 +348,30 @@ Value TypeSerializer::deserialize(const std::vector<std::uint8_t>& bytes, TypeID
             return Value(UUID(arr));
         }
         case TypeID::JSON:
-            return Value(Json::parse(std::string(reinterpret_cast<const char*>(ptr), size)));
+            if (size == 0) throw std::runtime_error("Buffer too small for JSON");
+            if (ptr[0] > static_cast<std::uint8_t>(JsonNode::Type::Object)) {
+                return Value(Json::parse(std::string(reinterpret_cast<const char*>(ptr), size)));
+            } else {
+                std::size_t offset = 0;
+                auto root = read_json_node(ptr, size, offset);
+                if (offset != size) throw std::runtime_error("Trailing bytes after JSON value");
+                return Value(Json(std::move(root)));
+            }
         case TypeID::Array: {
             if (size < 4) throw std::runtime_error("Buffer too small for Array");
             std::uint32_t count = read_le<std::uint32_t>(ptr);
             std::size_t offset = 4;
-            Array arr(TypeID::Invalid);
+            TypeID element_type = TypeID::Invalid;
+            if (size - offset >= sizeof(std::uint16_t) &&
+                read_le<std::uint16_t>(ptr + offset) == 0xffff) {
+                if (size - offset < 2 * sizeof(std::uint16_t)) {
+                    throw std::runtime_error("Buffer too small for Array element type");
+                }
+                offset += sizeof(std::uint16_t);
+                element_type = static_cast<TypeID>(read_le<std::uint16_t>(ptr + offset));
+                offset += sizeof(std::uint16_t);
+            }
+            Array arr(element_type);
             for (std::uint32_t i = 0; i < count; ++i) {
                 if (offset + 2 > size) throw std::runtime_error("Buffer too small for Array elem type");
                 std::uint16_t tid = read_le<std::uint16_t>(ptr + offset);
@@ -275,7 +417,12 @@ Value TypeSerializer::deserialize(const std::vector<std::uint8_t>& bytes, TypeID
         case TypeID::JSONB:
             return Value(std::string(reinterpret_cast<const char*>(ptr), size), TypeID::JSONB);
         case TypeID::Enum:
-            return Value(std::string(reinterpret_cast<const char*>(ptr), size), TypeID::Enum);
+            if (size < 8) throw std::runtime_error("Buffer too small for enum");
+            if (read_le<std::uint32_t>(ptr + 4) != size - 8) {
+                throw std::runtime_error("Invalid enum label size");
+            }
+            return Value(read_le<std::uint32_t>(ptr),
+                         std::string(reinterpret_cast<const char*>(ptr + 8), size - 8));
         case TypeID::Bit:
             return Value(std::string(reinterpret_cast<const char*>(ptr), size), TypeID::Bit);
         case TypeID::VarBit:

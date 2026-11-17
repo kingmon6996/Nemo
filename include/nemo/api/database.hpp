@@ -15,7 +15,11 @@ namespace api {
 }
 
 struct DatabaseConfig {
-    std::size_t buffer_pool_size{1024 * 1024 * 1024}; // 1GB default
+    // Buffer pool size in bytes.
+    // 0 (default) means auto-detect: 1/4 of available system RAM,
+    // clamped to [32 MB, 8 GB].
+    // Set to N * 1024 * 1024 to fix at N MB.
+    std::size_t buffer_pool_size{0};
     std::size_t worker_count{4};
     std::size_t connection_pool_size{16};
 };
@@ -28,6 +32,8 @@ struct DatabaseStatistics {
     std::size_t busy_workers{0};
     std::size_t buffer_hits{0};
     std::size_t buffer_misses{0};
+    std::size_t buffer_pool_frames{0};
+    bool        recovery_complete{false};   // Phase 4
 };
 
 // Main entry point for interacting with Nemo.
@@ -50,6 +56,10 @@ public:
 
     // Close the database connection safely
     Result<void> close();
+
+    // Flush and checkpoint database state to disk
+    Result<void> flush();
+    Result<void> checkpoint();
 
     // Check if the database is open
         bool is_open() const noexcept;

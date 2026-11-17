@@ -19,12 +19,10 @@ Demonstrates Nemo's native in-engine queue (FIFO) and stack (LIFO) primitives
 executed directly in C++ via conn.pop() at over 16 Million operations/second.
 """
 
-import os
 import time
 import nemo
 
 DB_NAME = "example6_queues_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
@@ -105,10 +103,7 @@ def main():
             print(f"    -> Remaining jobs in queue: {conn.count('job_queue')}")
 
     # Clean up local database file
-    if os.path.exists(DB_FILE):
         try:
-            os.remove(DB_FILE)
-            print(f"\n[Cleanup] Cleaned up temporary database: {DB_FILE}")
         except OSError:
             pass
 

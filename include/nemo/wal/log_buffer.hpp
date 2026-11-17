@@ -11,7 +11,7 @@ namespace nemo::wal {
 // A thread-safe buffer for batching LogRecords before flushing to disk.
 class LogBuffer {
 public:
-    explicit LogBuffer(std::size_t capacity = 1024 * 1024 * 4) // 4MB default
+    explicit LogBuffer(std::size_t capacity = 1024 * 1024 * 4) // 4 MB default
         : m_capacity(capacity) {
         m_buffer.reserve(m_capacity);
     }
@@ -43,6 +43,10 @@ public:
     std::size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_buffer.size();
+    }
+
+    std::size_t capacity() const noexcept {
+        return m_capacity;
     }
     
     void clear() {

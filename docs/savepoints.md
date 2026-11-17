@@ -89,7 +89,7 @@ Savepoint operations are available on both `SyncTransaction` / `AsyncTransaction
 ```python
 import nemo
 
-db = nemo.Database("ledger_db")
+db = nemo.connect("ledger_db")
 conn = db.connect_sync()
 
 conn.execute("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, balance DOUBLE);")

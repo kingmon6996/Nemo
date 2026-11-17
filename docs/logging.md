@@ -126,7 +126,7 @@ with nemo.connect("analytics") as db:
     with db.connect_sync() as conn:
         try:
             # Execute with a 1.5-second timeout
-            conn.execute("SELECT * FROM large_table;", timeout=1.5)
+            conn.execute("SELECT * FROM large_table;")
         except TimeoutError:
             print("Query exceeded the 1.5-second execution limit.")
 ```

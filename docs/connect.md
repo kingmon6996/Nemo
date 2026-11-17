@@ -1,184 +1,156 @@
-# Connecting to Nemo Database
+# Connecting to Nemo
 
-This guide explains how to connect to, configure, and manage Nemo databases using the Python SDK.
+This guide explains how to connect to and configure Nemo databases using the Python SDK.
 
 ---
 
-## The `nemo.connect()` Function
+## `nemo.connect()`
 
-The primary entry point for connecting to a Nemo database is `nemo.connect()`.
+The only entry point for opening a Nemo database.
 
 ```python
 import nemo
 
-# Syntax:
-db = nemo.connect(name: str, path: Optional[str] = None, timeout: float = 0.0)
+db = nemo.connect(name: str, buffer_pool_mb: int | None = None)
 ```
 
 ### Parameters
 
-- `name` (`str`, required): The logical name of the database (e.g., `"production"`, `"analytics"`, `"users"`).
-  - Only the database name is accepted.
-  - Do **not** include file extensions. Nemo strictly manages persistent `.nm` database files on disk.
-- `path` (`Optional[str]`, optional): The directory where the database file should reside. Defaults to the current working directory. Parent directories are created automatically if they do not exist.
-- `timeout` (`float`, default `0.0`): Connection timeout in seconds. `0.0` disables connection timeout.
+| Parameter | Type | Required | Description |
+|:---|:---|:---|:---|
+| `name` | `str` | ✅ Yes | Plain database name. No extension, no path, no dots. |
+| `buffer_pool_mb` | `int \| None` | No | RAM limit for the buffer pool in MB. Defaults to 1/4 of available system RAM (auto-detected), clamped 32 MB – 8 GB. |
 
-### Persistent Local Production Only
+### Storage Location
 
-Nemo is designed strictly as a high-concurrency, embedded on-disk production engine. In-memory databases (`:memory:`) are not supported; attempting to connect with `:memory:` will raise a `ValueError`.
+Nemo **always** stores databases in `.nemo/<name>/` relative to the current working directory. You cannot and must not pass a custom path.
 
-### Return Value
-
-Returns an instance of `nemo.Database`.
-
----
-
-## Connection Examples
-
-### 1. Connecting by Database Name
-
-```python
-import nemo
-
-# Connects to or creates ./analytics.nm in current directory
-db = nemo.connect("analytics")
+```
+<cwd>/
+└── .nemo/
+    └── <name>/
+        ├── data.nm      ← main data file (8 KB pages, 128-byte DB header)
+        ├── wal/         ← WAL segment files (Phase 3+)
+        └── lock         ← process-level lock file (Phase 5+)
 ```
 
-### 2. Connecting with a Target Directory and Timeout
+Nemo creates these directories and files automatically on first connect. If they already exist, Nemo opens the existing database.
+
+### Name Rules
+
+| Rule | Example (valid) | Example (invalid) |
+|:---|:---|:---|
+| Plain alphanumeric + underscore | `mydb`, `users_v2` | — |
+| No dots or file extensions | — | `mydb.nm`, `db.v2` |
+| No path separators | — | `data/mydb`, `data\mydb` |
+| No `..` traversal | — | `../etc` |
+| No `:memory:` | — | `:memory:` |
+| Non-empty string | — | `""` |
+
+Violations raise `ValueError` with a descriptive message.
+
+---
+
+## Examples
+
+### Basic connect
 
 ```python
 import nemo
 
-# Connects to or creates ./data/storage/production.nm with a 5-second timeout
-# Automatically creates the 'data/storage' directory if needed
-db = nemo.connect("production", path="data/storage", timeout=5.0)
+# Creates or opens .nemo/mydb/ in the current working directory
+db = nemo.connect("mydb")
+conn = db.connect_sync()
+conn.execute("CREATE TABLE t (id INT, v TEXT);")
+db.close()
 ```
 
----
-
-## The `nemo.Database` Object
-
-The `Database` instance manages the database handle, path resolution, and connector creation.
-
-### Attributes
-
-- `db.name` (`str`): Base name of the database.
-- `db.path` (`str`): Absolute filesystem path to the persistent `.nm` file.
-- `db.timeout` (`float`): Configured connection timeout in seconds.
-
-### Connector Methods
-
-| Method | Return Type | Description |
-| :--- | :--- | :--- |
-| `db.connect()` | `SyncConnection` | Creates a synchronous database connection (alias for `connect_sync`). |
-| `db.connect_sync()` | `SyncConnection` | Creates a synchronous database connection. |
-| `db.sync_connector()` | `SyncConnector` | Creates a synchronous database connection (alias for `connect_sync`). |
-| `db.connect_async()` | `AsyncConnection` | Creates an asynchronous (`asyncio`) database connection. |
-| `db.async_connector()` | `AsyncConnector` | Creates an asynchronous database connection (alias for `connect_async`). |
-| `db.create_pool_sync(max_connections=16)` | `SyncConnectionPool` | Creates a thread-safe synchronous connection pool. |
-| `db.sync_connector_pool(max_connections=16)` | `SyncConnectorPool` | Alias for `create_pool_sync`. |
-| `db.create_pool_async(max_connections=16)` | `AsyncConnectionPool` | Creates an asyncio-compatible connection pool. |
-| `db.async_connector_pool(max_connections=16)` | `AsyncConnectorPool` | Alias for `create_pool_async`. |
-| `db.close()` | `None` | Closes the underlying database handle and releases resources. |
-
----
-
-## Context Manager Usage
-
-The `Database` object supports Python's `with` statement for automatic closing and resource cleanup.
-
-### Synchronous Context Manager
+### With buffer pool limit
 
 ```python
 import nemo
 
-with nemo.connect("analytics", path="data") as db:
+# Pin the buffer pool to 512 MB
+db = nemo.connect("analytics", buffer_pool_mb=512)
+```
+
+### Context manager
+
+```python
+import nemo
+
+with nemo.connect("production") as db:
     with db.connect_sync() as conn:
-        conn.execute("CREATE TABLE metrics (id INTEGER PRIMARY KEY, value DOUBLE);")
-        conn.execute("INSERT INTO metrics VALUES (?, ?);", (1, 99.4))
-        result = conn.execute("SELECT * FROM metrics;")
-        print(result.fetchall())
+        result = conn.execute("SELECT * FROM accounts;")
+        for row in result:
+            print(row)
 ```
 
-### Asynchronous Context Manager
+### Async usage
 
 ```python
-import asyncio
-import nemo
+import asyncio, nemo
 
 async def main():
-    with nemo.connect("analytics", path="data") as db:
+    with nemo.connect("production") as db:
         async with db.connect_async() as conn:
-            await conn.execute("CREATE TABLE metrics (id INTEGER PRIMARY KEY, value DOUBLE);")
-            await conn.execute("INSERT INTO metrics VALUES (?, ?);", (1, 99.4))
-            result = await conn.execute("SELECT * FROM metrics;")
-            print(await result.fetchall())
+            result = await conn.execute("SELECT count(*) FROM events;")
+            print(await result.fetchone())
 
 asyncio.run(main())
 ```
 
 ---
 
+## `nemo.Database` Object
+
+| Attribute | Type | Description |
+|:---|:---|:---|
+| `db.name` | `str` | Plain database name passed to `connect()`. |
+| `db.path` | `str` | Absolute path to the `.nemo/<name>/` root folder. |
+| `db.is_memory` | `bool` | Always `False` — Nemo is disk-primary only. |
+
+### Connector Methods
+
+| Method | Returns | Description |
+|:---|:---|:---|
+| `db.connect()` | `SyncConnection` | Synchronous connection (alias for `connect_sync`). |
+| `db.connect_sync()` | `SyncConnection` | Synchronous connection. |
+| `db.connect_async()` | `AsyncConnection` | Asyncio connection. |
+| `db.create_pool_sync(max_connections=16)` | `SyncConnectionPool` | Thread-safe synchronous pool. |
+| `db.create_pool_async(max_connections=16)` | `AsyncConnectionPool` | Asyncio-compatible pool. |
+| `db.flush()` | `None` | Flush dirty buffer-pool pages to disk. |
+| `db.checkpoint()` | `None` | Checkpoint WAL to main data file. |
+| `db.close()` | `None` | Close database handle and release resources. |
+
+---
+
 ## Connection Pooling
-
-For multi-threaded or high-concurrency workloads, use connection pools to reuse connection leases.
-
-### Synchronous Pool
 
 ```python
 import nemo
 
 with nemo.connect("production") as db:
     pool = db.create_pool_sync(max_connections=8)
-    
     with pool.acquire() as conn:
-        conn.execute("INSERT INTO logs VALUES (?);", ("Application started",))
-    
+        conn.execute("INSERT INTO logs VALUES (?);", ("started",))
     pool.close()
 ```
 
-### Asynchronous Pool
+---
 
-```python
-import asyncio
-import nemo
+## What Does NOT Exist
 
-async def worker(pool, worker_id: int):
-    async with pool.connection() as conn:
-        await conn.execute("INSERT INTO worker_events VALUES (?, ?);", (worker_id, "active"))
-
-async def main():
-    with nemo.connect("production") as db:
-        pool = db.create_pool_async(max_connections=8)
-        tasks = [worker(pool, i) for i in range(10)]
-        await asyncio.gather(*tasks)
-        await pool.close()
-
-asyncio.run(main())
-```
+- ❌ `path=` parameter — all databases live in `.nemo/<name>/`, period.
+- ❌ `timeout=` parameter — connection is always immediate (embedded, local).
+- ❌ `:memory:` — Nemo is a strictly disk-primary database engine.
+- ❌ Connecting via a `.nm` file path — use the plain name only.
 
 ---
 
-## Installation
+## Related
 
-Nemo is distributed on PyPI under the official package name `nemo-py`:
-
-```bash
-pip install nemo-py
-```
-
-Import in Python as:
-```python
-import nemo
-```
-
----
-
-## Related Runnable Examples
-
-- [`example_1.py`](../example/example_1.py): Basic Synchronous CRUD Operations and Connection Management.
-- [`example_2.py`](../example/example_2.py): Asynchronous Operations and `AsyncConnectionPool`.
-- [`example_10.py`](../example/example_10.py): Multi-Threaded Sync Connection Pooling and Concurrency.
-- [`example_40.py`](../example/example_40.py): End-to-End Microservice Architecture with Connection Pools.
-
-
+- [HOW_IT_WORKS.md](../HOW_IT_WORKS.md) — Architecture deep-dive.
+- [docs/syncconnector.md](syncconnector.md) — Synchronous connection reference.
+- [docs/asyncconnector.md](asyncconnector.md) — Async connection reference.
+- [docs/sql.md](sql.md) — SQL syntax and DDL reference.

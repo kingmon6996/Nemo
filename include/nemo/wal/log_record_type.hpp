@@ -18,6 +18,7 @@ enum class LogRecordType : std::uint8_t {
     Insert = 10,
     Update = 11,
     Delete = 12,
+    PageWrite = 13,
     
     // Checkpointing
     CheckpointBegin = 20,

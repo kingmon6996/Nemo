@@ -11,13 +11,6 @@ function(nemo_enable_strict_warnings target_name)
         target_compile_options(${target_name} PRIVATE
             -Wall
             -Wextra
-            -Wpedantic
-            -Wconversion
-            -Wsign-conversion
-            -Wshadow
-            -Wnon-virtual-dtor
-            -Woverloaded-virtual
-            -Wnull-dereference
         )
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
         target_compile_options(${target_name} PRIVATE

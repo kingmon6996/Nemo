@@ -25,25 +25,25 @@ FileManager& FileManager::operator=(FileManager&& other) noexcept {
 }
 
 Result<void> FileManager::create_file(const std::filesystem::path& path) {
-    if (m_is_open) return Result<void>(Status::InvalidState);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_is_open) return Result<void>(Status::InvalidState);
+        if (std::filesystem::exists(path)) {
+            return Result<void>(Status::AlreadyExists);
+        }
 
-    // Ensure it doesn't already exist
-    if (std::filesystem::exists(path)) {
-        return Result<void>(Status::AlreadyExists);
+        m_file.open(path, std::ios::out | std::ios::binary);
+        if (!m_file.is_open()) {
+            return Result<void>(Status::IOError);
+        }
+        m_file.close();
     }
 
-    // Open for out (creates file) in binary mode
-    m_file.open(path, std::ios::out | std::ios::binary);
-    if (!m_file.is_open()) {
-        return Result<void>(Status::IOError);
-    }
-    m_file.close();
-
-    // Now open for read/write
     return open_file(path);
 }
 
 Result<void> FileManager::open_file(const std::filesystem::path& path) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_is_open) return Result<void>(Status::InvalidState);
 
     m_file.open(path, std::ios::in | std::ios::out | std::ios::binary);
@@ -58,13 +58,15 @@ Result<void> FileManager::open_file(const std::filesystem::path& path) {
 }
 
 Result<void> FileManager::close() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_is_open) {
-        // Try flushing before close
-        (void)flush();
+        m_file.flush();
+        const bool flush_failed = m_file.fail();
+        if (flush_failed) m_file.clear();
         m_file.close();
         m_is_open = false;
         
-        if (m_file.fail()) {
+        if (flush_failed || m_file.fail()) {
             return Result<void>(Status::IOError);
         }
     }
@@ -72,10 +74,12 @@ Result<void> FileManager::close() {
 }
 
 bool FileManager::is_open() const noexcept {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_is_open;
 }
 
 Result<void> FileManager::read(std::uint64_t offset, std::span<std::byte> buffer) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_is_open) return Result<void>(Status::InvalidState);
 
     m_file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
@@ -94,6 +98,7 @@ Result<void> FileManager::read(std::uint64_t offset, std::span<std::byte> buffer
 }
 
 Result<void> FileManager::write(std::uint64_t offset, std::span<const std::byte> buffer) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_is_open) return Result<void>(Status::InvalidState);
 
     m_file.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
@@ -112,6 +117,7 @@ Result<void> FileManager::write(std::uint64_t offset, std::span<const std::byte>
 }
 
 Result<void> FileManager::flush() {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_is_open) return Result<void>(Status::InvalidState);
 
     m_file.flush();
@@ -127,6 +133,7 @@ Result<void> FileManager::flush() {
 }
 
 Result<std::uint64_t> FileManager::file_size() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_is_open) return Result<std::uint64_t>(Status::InvalidState);
 
     // Remember current position

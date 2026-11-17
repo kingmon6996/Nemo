@@ -8,12 +8,10 @@ each worker atomically reserves a private, contiguous block of primary keys from
 a sequence, completely eliminating lock contention during massive concurrent ingestion.
 """
 
-import os
 import threading
 import nemo
 
 DB_NAME = "example48_id_range_partitioning"
-DB_FILE = f"{DB_NAME}.nm"
 
 NUM_WORKERS = 4
 ITEMS_PER_WORKER = 50
@@ -36,10 +34,7 @@ def main():
     print("   NEMO DATABASE ENGINE — EXAMPLE 48: ID RANGE PARTITIONING")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -86,10 +81,7 @@ def main():
                 print("\n[5] Atomic ID Range Partitioning Verified Successfully.")
 
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\n" + "=" * 70)
     print("   EXAMPLE 48 COMPLETED SUCCESSFULLY!")
     print("=" * 70)

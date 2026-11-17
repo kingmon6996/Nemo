@@ -36,6 +36,15 @@ std::optional<Value> TypeCast::cast(const Value& value, TypeID target_type) {
     if (target_type == TypeID::Double) {
         if (value.type() == TypeID::Integer) return Value(static_cast<double>(value.get<std::int32_t>()));
         if (value.type() == TypeID::BigInt) return Value(static_cast<double>(value.get<std::int64_t>()));
+        if (value.type() == TypeID::SmallInt) return Value(static_cast<double>(value.get<std::int16_t>()));
+        if (value.type() == TypeID::Real) return Value(static_cast<double>(value.get<float>()));
+    }
+
+    if (target_type == TypeID::Real) {
+        if (value.type() == TypeID::Integer) return Value(static_cast<float>(value.get<std::int32_t>()));
+        if (value.type() == TypeID::BigInt) return Value(static_cast<float>(value.get<std::int64_t>()));
+        if (value.type() == TypeID::SmallInt) return Value(static_cast<float>(value.get<std::int16_t>()));
+        if (value.type() == TypeID::Double) return Value(static_cast<float>(value.get<double>()));
     }
     
     // String parsing
@@ -45,6 +54,7 @@ std::optional<Value> TypeCast::cast(const Value& value, TypeID target_type) {
             if (target_type == TypeID::Integer) return Value(static_cast<std::int32_t>(std::stoi(str)));
             if (target_type == TypeID::BigInt) return Value(static_cast<std::int64_t>(std::stoll(str)));
             if (target_type == TypeID::Double) return Value(std::stod(str));
+            if (target_type == TypeID::Real) return Value(static_cast<float>(std::stof(str)));
             if (target_type == TypeID::UUID) {
                 auto u = UUID::from_string(str);
                 if (u) return Value(*u);
@@ -82,7 +92,10 @@ std::optional<Value> TypeCast::cast(const Value& value, TypeID target_type) {
     if ((target_type == TypeID::JSON || target_type == TypeID::JSONB) &&
         (value.type() == TypeID::JSON || value.type() == TypeID::JSONB ||
          value.type() == TypeID::Text || value.type() == TypeID::VarChar)) {
-        return Value(value.to_string(), target_type);
+        if (target_type == TypeID::JSON) {
+            return Value(Json::parse(value.to_string()));
+        }
+        return Value(value.to_string(), TypeID::JSONB);
     }
 
     // Cast to String
@@ -105,9 +118,11 @@ std::optional<Value> TypeCast::cast(const Value& value, TypeID target_type) {
                 return std::nullopt;
             }
             if (target_type == TypeID::Inet || target_type == TypeID::Cidr || target_type == TypeID::MacAddr ||
-                target_type == TypeID::Bit || target_type == TypeID::VarBit || target_type == TypeID::Range ||
-                target_type == TypeID::Enum) {
+                target_type == TypeID::Bit || target_type == TypeID::VarBit || target_type == TypeID::Range) {
                 return Value(str, target_type);
+            }
+            if (target_type == TypeID::Enum) {
+                return Value(0, str);
             }
         } catch (...) {
             return std::nullopt; // Parse failure

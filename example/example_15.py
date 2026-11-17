@@ -7,21 +7,16 @@ Demonstrates storage and precision boundaries of TINYINT, SMALLINT,
 INTEGER, BIGINT, REAL (float32), and DOUBLE (float64).
 """
 
-import os
 import nemo
 
 DB_NAME = "example15_numeric_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 15: NUMERIC DATATYPES")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -55,9 +50,6 @@ def main():
 
         print("\n[PASS] Example 15 completed successfully!\n")
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
 if __name__ == "__main__":
     main()

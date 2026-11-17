@@ -24,13 +24,12 @@ This document provides a comprehensive technical reference for all module-level 
 
 ## 1. Module-Level Functions
 
-### `nemo.connect(name_or_path, **kwargs) -> Database`
-Opens or creates a Nemo database file (`.nm`) and returns a thread-safe `Database` handle.
+### `nemo.connect(name, buffer_pool_mb=None) -> Database`
+Opens or creates a Nemo database in `.nemo/<name>/` relative to the current working directory.
 
 - **Parameters**:
-  - `name_or_path` (*str*): The database name (e.g. `'production'`, `'analytics'`) or a file system path (e.g. `'/var/data/app.nm'`). If an extension is omitted, `.nm` is appended automatically.
-  - `create_if_missing` (*bool*, optional): If `True` (default), creates the database file if it does not already exist.
-  - `buffer_pool_size` (*int*, optional): Page cache frame count in memory. Defaults to `1024` (4MB).
+  - `name` (*str*): Plain database name — no extension, no path, no dots. Example: `'production'`, `'analytics'`.
+  - `buffer_pool_mb` (*int | None*, optional): RAM limit for the buffer pool in megabytes. Defaults to 1/4 of available system RAM, clamped to [32 MB, 8 GB].
 - **Returns**: A managed `nemo.Database` instance.
 - **Context Manager**: Supports `with nemo.connect(...) as db:` for deterministic closing.
 
@@ -44,7 +43,7 @@ with nemo.connect("production") as db:
 
 ---
 
-### `nemo.connect_sync(name_or_path, **kwargs) -> SyncConnection`
+### `nemo.connect_sync(name) -> SyncConnection`
 Direct convenience shortcut that creates or opens a database and immediately acquires a synchronous `SyncConnection`.
 
 ```python
@@ -56,7 +55,7 @@ with nemo.connect_sync("cache") as conn:
 
 ---
 
-### `nemo.connect_async(name_or_path, **kwargs) -> AsyncConnection`
+### `nemo.connect_async(name) -> AsyncConnection`
 Direct convenience shortcut that creates or opens a database and immediately returns an asynchronous `AsyncConnection`.
 
 ```python
@@ -109,10 +108,10 @@ Spawns a new synchronous connection attached to this database. Supports the `wit
 #### `db.connect_async() -> AsyncConnection`
 Spawns a new asynchronous connection attached to this database. Supports the `async with` context manager.
 
-#### `db.create_sync_pool(min_connections=1, max_connections=10) -> SyncConnectionPool`
+#### `db.create_pool_sync(max_connections=16) -> SyncConnectionPool`
 Initializes a thread-safe connection pool for multi-threaded applications.
 
-#### `db.create_async_pool(min_connections=1, max_connections=10) -> AsyncConnectionPool`
+#### `db.create_pool_async(max_connections=16) -> AsyncConnectionPool`
 Initializes an `asyncio`-native connection pool for high-concurrency event loops.
 
 #### `db.stats() -> dict`
@@ -121,6 +120,12 @@ Returns operational metrics:
 - `'buffer_pool_hit_rate'`: Percentage of reads served from cache.
 - `'wal_lsn'`: Current write-ahead log sequence number.
 - `'active_transactions'`: Count of currently uncommitted transactions.
+
+#### `db.flush()`
+Flush dirty buffer-pool pages to `data.nm` without a full checkpoint.
+
+#### `db.checkpoint()`
+Flush and checkpoint the WAL — appends a checkpoint record so recovery can skip older segments.
 
 #### `db.close()`
 Flushes dirty pages, closes file handles, and releases storage locks.
@@ -332,7 +337,7 @@ Pre-compiled query objects created via `conn.prepare(sql)`.
 ### `SyncConnectionPool`
 Thread-safe connection pool for multi-threaded applications:
 ```python
-pool = db.create_sync_pool(min_connections=2, max_connections=10)
+pool = db.create_pool_sync(max_connections=10)
 
 with pool.acquire() as conn:
     res = conn.execute("SELECT 1;")
@@ -341,7 +346,7 @@ with pool.acquire() as conn:
 ### `AsyncConnectionPool`
 `asyncio`-compatible pool for asynchronous frameworks (FastAPI, Starlette, Sanic, Tornado):
 ```python
-pool = db.create_async_pool(min_connections=5, max_connections=20)
+pool = db.create_pool_async(max_connections=20)
 
 async with pool.acquire() as conn:
     res = await conn.execute("SELECT 1;")

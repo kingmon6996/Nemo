@@ -21,6 +21,7 @@ struct RecordHeader {
     static constexpr std::uint16_t FLAG_DELETED = 1 << 0;
     static constexpr std::uint16_t FLAG_HAS_NULLS = 1 << 1;
     static constexpr std::uint16_t FLAG_HAS_VARLEN = 1 << 2;
+    static constexpr std::uint16_t FLAG_VARLEN_OFFSETS_INCLUDE_NULLS = 1 << 3;
 
     bool is_deleted() const noexcept { return (flags & FLAG_DELETED) != 0; }
     void set_deleted(bool v) noexcept { 
@@ -38,6 +39,15 @@ struct RecordHeader {
     void set_has_varlen(bool v) noexcept { 
         if (v) flags = static_cast<std::uint16_t>(flags | FLAG_HAS_VARLEN); 
         else flags = static_cast<std::uint16_t>(flags & ~FLAG_HAS_VARLEN); 
+    }
+
+    bool varlen_offsets_include_nulls() const noexcept {
+        return (flags & FLAG_VARLEN_OFFSETS_INCLUDE_NULLS) != 0;
+    }
+
+    void set_varlen_offsets_include_nulls(bool v) noexcept {
+        if (v) flags = static_cast<std::uint16_t>(flags | FLAG_VARLEN_OFFSETS_INCLUDE_NULLS);
+        else flags = static_cast<std::uint16_t>(flags & ~FLAG_VARLEN_OFFSETS_INCLUDE_NULLS);
     }
 };
 

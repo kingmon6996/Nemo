@@ -40,6 +40,7 @@ private:
     std::size_t m_var_offset_array;
     std::size_t m_var_data_offset;
     bool m_has_nulls;
+    bool m_varlen_offsets_include_nulls;
 };
 
 } // namespace nemo::storage

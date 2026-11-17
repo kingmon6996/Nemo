@@ -9,21 +9,16 @@ SIMD vector aggregations, atomic FIFO queue popping, direct columnar extraction,
 and instantaneous table truncation in a single comprehensive workflow.
 """
 
-import os
 import nemo
 
 DB_NAME = "example50_master_showcase"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 50: MASTER ARCHITECTURE SHOWCASE")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             print("\n[1] Initializing Multi-Tenant Schemas and Sequences...")
@@ -150,10 +145,7 @@ def main():
             print("\n[9] Pool cleanly released.")
 
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\n" + "=" * 70)
     print("   EXAMPLE 50 MASTER SHOWCASE COMPLETED SUCCESSFULLY!")
     print("=" * 70)

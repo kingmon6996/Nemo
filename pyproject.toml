@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "nemo-py"
-version = "0.2.2"
+version = "0.2.3"
 authors = [
   { name="Pravanjan Roy" },
 ]
@@ -44,3 +44,14 @@ cmake.define.NEMO_BUILD_EXAMPLES = "OFF"
 
 [tool.cibuildwheel]
 build-verbosity = 1
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Benchmark scripts are long-running standalone programs; exclude from the
+# normal test suite.  Run them directly:
+#   python tests/benchmark_nemo_vs_sqlite_20m.py
+#   python tests/benchmark_datatypes_and_functions_20m.py
+ignore = [
+    "tests/benchmark_nemo_vs_sqlite_20m.py",
+    "tests/benchmark_datatypes_and_functions_20m.py",
+]

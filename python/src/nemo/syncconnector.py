@@ -79,6 +79,8 @@ class SyncTransaction:
                 txn_logger.debug(f"Transaction {self._id} started", extra={"conn_id": self._conn._id, "txn_id": self._id})
             if hasattr(self._conn._native, "transaction"):
                 self._native_txn = self._conn._native.transaction()
+            # Issue BEGIN so the C++ engine knows a transaction is open
+            self._conn.execute("BEGIN;")
             self._active = True
         return self
 
@@ -89,6 +91,8 @@ class SyncTransaction:
             if self._native_txn is not None:
                 self._native_txn.commit()
                 self._native_txn = None
+            else:
+                self._conn.execute("COMMIT;")
             self._active = False
 
     def rollback(self):
@@ -98,6 +102,8 @@ class SyncTransaction:
             if self._native_txn is not None:
                 self._native_txn.rollback()
                 self._native_txn = None
+            else:
+                self._conn.execute("ROLLBACK;")
             self._active = False
 
     def __enter__(self):
@@ -129,23 +135,35 @@ class SyncTransaction:
         return False
 
 class SyncConnection:
-    __slots__ = ("_native", "_id")
+    __slots__ = ("_native", "_id", "_has_logging")
     def __init__(self, native_conn):
         self._native = native_conn
         self._id = uuid.uuid4().hex[:8]
+        cfg = get_config()
+        self._has_logging = bool(cfg.query_logging or cfg.slow_query_threshold_ms is not None)
         if conn_logger.isEnabledFor(logging.DEBUG):
             conn_logger.debug(f"Connection acquired", extra={"conn_id": self._id})
 
     def execute(self, sql: str, parameters: Optional[Sequence[object]] = None, timeout: float = 0.0) -> SyncResult:
-        cfg = get_config()
-        if cfg.query_logging or cfg.slow_query_threshold_ms is not None:
+        if self._has_logging:
             with QueryContext("EXECUTE", sql, parameters or (), self._id):
-                return SyncResult(self._native.execute(sql, parameters or (), timeout))
-        return SyncResult(self._native.execute(sql, parameters or (), timeout))
+                return SyncResult(self._native.execute(sql, parameters, timeout))
+        return SyncResult(self._native.execute(sql, parameters, timeout))
+
+    def flush(self):
+        if hasattr(self._native, "flush"):
+            self._native.flush()
+
+    def checkpoint(self):
+        if hasattr(self._native, "checkpoint"):
+            self._native.checkpoint()
+
+    def commit(self):
+        if hasattr(self._native, "commit"):
+            self._native.commit()
 
     def executemany(self, sql: str, parameters_list: Sequence[Sequence[object]]):
-        cfg = get_config()
-        if cfg.query_logging or cfg.slow_query_threshold_ms is not None:
+        if self._has_logging:
             with QueryContext("EXECUTEMANY", sql, [], self._id):
                 self._native.executemany(sql, parameters_list)
         else:
@@ -220,10 +238,14 @@ class SyncConnection:
     def commit(self):
         if hasattr(self._native, "commit"):
             self._native.commit()
+        else:
+            self.execute("COMMIT;")
 
     def rollback(self):
         if hasattr(self._native, "rollback"):
             self._native.rollback()
+        else:
+            self.execute("ROLLBACK;")
 
     def savepoint(self, name: str):
         return self.execute(f"SAVEPOINT {name};")
@@ -237,6 +259,10 @@ class SyncConnection:
     def set_autocommit(self, enabled: bool):
         if hasattr(self._native, "set_autocommit"):
             self._native.set_autocommit(enabled)
+
+    def begin(self):
+        """Start an explicit transaction on this connection (issues BEGIN)."""
+        return self.execute("BEGIN;")
 
     def cancel(self):
         if hasattr(self._native, "cancel"):

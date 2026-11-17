@@ -80,10 +80,12 @@ add_library(nemo
     wal/wal_segment.cpp
     wal/wal_manager.cpp
     wal/log_reader.cpp
+    wal/checkpoint_state.cpp
     wal/checkpoint_manager.cpp
     wal/recovery_manager.cpp
     api/database.cpp
     api/connection.cpp
+    api/state_storage.cpp
     api/transaction.cpp
     api/result.cpp
     api/row.cpp

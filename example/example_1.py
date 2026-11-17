@@ -19,23 +19,18 @@ Demonstrates database connection, table creation, single inserts, batch inserts,
 fetching rows, updates, deletions, and instant table maintenance.
 """
 
-import os
 import nemo
 
 DB_NAME = "example1_crud_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 1: BASIC SYNCHRONOUS CRUD")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
-        # 1. Connect to or create a local database (.nm)
+        # 1. Connect to or create a local database (stored in .nemo/example1_crud_demo/)
         print(f"\n[1] Connecting to database '{DB_NAME}'...")
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -105,13 +100,7 @@ def main():
         print("\n[PASS] Example 1 completed successfully!\n")
     finally:
         # Clean up generated local database file
-        if os.path.exists(DB_FILE):
-            try:
-                os.remove(DB_FILE)
-                print(f"[Cleanup] Cleaned up temporary database: {DB_FILE}\n")
-            except OSError:
-                pass
-
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
+        print(f"[Cleanup] Cleaned up temporary database: .nemo/{DB_NAME}")
 if __name__ == "__main__":
     main()

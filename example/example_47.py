@@ -8,22 +8,17 @@ in 1024-element aligned chunks using CPU vector instructions (AVX2 / NEON)
 for SUM, AVG, MIN, and MAX operations yielding up to 93x higher throughput than row-by-row iteration.
 """
 
-import os
 import time
 import nemo
 
 DB_NAME = "example47_simd_aggregates"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 47: VECTORIZED SIMD AGGREGATES")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -75,10 +70,7 @@ def main():
                 print("    - Delivers up to 93x higher throughput than standard row iteration.")
 
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\n" + "=" * 70)
     print("   EXAMPLE 47 COMPLETED SUCCESSFULLY!")
     print("=" * 70)

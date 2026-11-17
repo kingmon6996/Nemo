@@ -7,21 +7,16 @@ Demonstrates popping the most recent state transitions from the tail
 of a table using atomic LIFO operations (conn.pop(..., direction='lifo')).
 """
 
-import os
 import nemo
 
 DB_NAME = "example34_lifo_stack_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 34: LIFO AUDIT STACK")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -54,9 +49,6 @@ def main():
 
         print("\n[PASS] Example 34 completed successfully!\n")
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
 if __name__ == "__main__":
     main()

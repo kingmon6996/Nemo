@@ -8,22 +8,17 @@ on the inner relation, streaming the probe relation with selective column
 projection pushdown, and eliminating Cartesian cross-product costs.
 """
 
-import os
 import time
 import nemo
 
 DB_NAME = "example46_hash_joins"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 46: IN-MEMORY HASH JOINS")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -87,10 +82,7 @@ def main():
                 print("    - Probed 25 employee rows directly against hash buckets with zero disk rewrites.")
 
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\n" + "=" * 70)
     print("   EXAMPLE 46 COMPLETED SUCCESSFULLY!")
     print("=" * 70)

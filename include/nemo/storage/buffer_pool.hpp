@@ -12,8 +12,11 @@
 #include <vector>
 #include <memory>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <list>
+#include <unordered_set>
+#include <span>
 
 namespace nemo::storage {
 
@@ -50,8 +53,12 @@ public:
     
     Result<void> flush_page(PageID page_id);
     Result<void> flush_all();
+    void discard_dirty_pages() noexcept;
+    Result<void> write_recovery_page(PageID page_id,
+                                     std::span<const std::byte> page_bytes);
 
     const BufferPoolStats& stats() const noexcept { return m_stats; }
+    std::size_t frame_count() const noexcept { return m_pool_size; }
     
     // Re-expose DatabaseHeader from DiskManager
     const DatabaseHeader& get_database_header() const { return m_disk_manager->get_database_header(); }
@@ -75,7 +82,9 @@ private:
 
     // Synchronization and lookup
     std::mutex m_page_table_mutex;
+    std::condition_variable m_page_table_cv;
     std::unordered_map<PageID, FrameID> m_page_table;
+    std::unordered_set<PageID> m_loading_pages;
     std::list<FrameID> m_free_list; // Unused, completely empty frames
 
     BufferPoolStats m_stats;

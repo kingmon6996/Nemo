@@ -8,6 +8,8 @@
 #include <cctype>
 #include <algorithm>
 #include <string_view>
+#include <thread>
+#include <charconv>
 
 namespace nemo::api {
 
@@ -28,6 +30,23 @@ inline size_t ifind(std::string_view haystack, std::string_view needle) {
         if (match) return i;
     }
     return std::string_view::npos;
+}
+
+bool is_identifier_character(char value) {
+    const auto ch = static_cast<unsigned char>(value);
+    return std::isalnum(ch) != 0 || value == '_';
+}
+
+bool query_mentions_table(std::string_view sql, std::string_view table_name) {
+    if (table_name.empty() || sql.size() < table_name.size()) return false;
+    for (std::size_t offset = 0; offset + table_name.size() <= sql.size(); ++offset) {
+        if (ifind(sql.substr(offset, table_name.size()), table_name) != 0) continue;
+        const bool left_boundary = offset == 0 || !is_identifier_character(sql[offset - 1]);
+        const auto end = offset + table_name.size();
+        const bool right_boundary = end == sql.size() || !is_identifier_character(sql[end]);
+        if (left_boundary && right_boundary) return true;
+    }
+    return false;
 }
 
 std::string extract_table_name(std::string_view sql) {
@@ -55,6 +74,12 @@ std::string extract_table_name(std::string_view sql) {
         return "";
     };
 
+    const auto lowered_sql = query_engine::to_lower(sql);
+    if (lowered_sql.starts_with("create table")) {
+        std::string created_table = find_after("table ");
+        if (!created_table.empty()) return created_table;
+    }
+
     std::string tbl = find_after("into ");
     if (!tbl.empty()) return tbl;
     tbl = find_after("from ");
@@ -64,6 +89,100 @@ std::string extract_table_name(std::string_view sql) {
     tbl = find_after("update ");
     if (!tbl.empty()) return tbl;
     return "default";
+}
+
+inline void parse_simple_values_ext(
+    std::string_view inside,
+    std::vector<types::Value>& vals,
+    size_t& first_tok_start_out,
+    size_t& first_tok_end_out,
+    bool& first_is_int_out,
+    std::int64_t& first_int_val_out
+) {
+    vals.clear();
+    vals.reserve(32);
+    first_tok_start_out = 0;
+    first_tok_end_out = 0;
+    first_is_int_out = false;
+    first_int_val_out = 0;
+
+    auto process_token = [&](std::string_view raw_token, size_t rel_start, size_t rel_end, bool is_first) {
+        std::string_view token = raw_token;
+        size_t l_trim = 0;
+        while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) {
+            token.remove_prefix(1);
+            l_trim++;
+        }
+        size_t r_trim = 0;
+        while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) {
+            token.remove_suffix(1);
+            r_trim++;
+        }
+        if (is_first) {
+            first_tok_start_out = rel_start + l_trim;
+            first_tok_end_out = rel_end - r_trim;
+        }
+        if (token.empty()) return;
+
+        if (token.size() >= 2 && ((token.front() == '\'' && token.back() == '\'') || (token.front() == '"' && token.back() == '"'))) {
+            vals.emplace_back(std::string(token.data() + 1, token.size() - 2), types::TypeID::Text);
+        } else if (token == "true" || token == "TRUE") {
+            vals.emplace_back(true);
+        } else if (token == "false" || token == "FALSE") {
+            vals.emplace_back(false);
+        } else if (token == "null" || token == "NULL") {
+            vals.emplace_back();
+        } else if (token.find('.') != std::string_view::npos) {
+            char buf[64];
+            size_t len = std::min(token.size(), sizeof(buf) - 1);
+            std::memcpy(buf, token.data(), len);
+            buf[len] = '\0';
+            vals.emplace_back(std::strtod(buf, nullptr));
+        } else {
+            std::int64_t v = 0;
+            auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), v);
+            if (ec == std::errc()) {
+                vals.emplace_back(v);
+                if (is_first) {
+                    first_is_int_out = true;
+                    first_int_val_out = v;
+                }
+            } else {
+                char buf[64];
+                size_t len = std::min(token.size(), sizeof(buf) - 1);
+                std::memcpy(buf, token.data(), len);
+                buf[len] = '\0';
+                std::int64_t val = static_cast<std::int64_t>(std::strtoll(buf, nullptr, 10));
+                vals.emplace_back(val);
+                if (is_first) {
+                    first_is_int_out = true;
+                    first_int_val_out = val;
+                }
+            }
+        }
+    };
+
+    size_t token_start = 0;
+    bool in_quote = false;
+    char q_char = '\0';
+    bool first_done = false;
+
+    for (size_t k = 0; k < inside.size(); ++k) {
+        char ch = inside[k];
+        if (!in_quote && (ch == '\'' || ch == '"')) {
+            in_quote = true;
+            q_char = ch;
+        } else if (in_quote && ch == q_char) {
+            in_quote = false;
+        } else if (!in_quote && ch == ',') {
+            process_token(inside.substr(token_start, k - token_start), token_start, k, !first_done);
+            first_done = true;
+            token_start = k + 1;
+        }
+    }
+    if (token_start < inside.size()) {
+        process_token(inside.substr(token_start), token_start, inside.size(), !first_done);
+    }
 }
 
 std::vector<types::Value> parse_simple_values(std::string_view sql) {
@@ -93,71 +212,10 @@ std::vector<types::Value> parse_simple_values(std::string_view sql) {
     if (end == std::string_view::npos || end <= start) return vals;
     
     std::string_view inside = sql.substr(start + 1, end - start - 1);
-    vals.reserve(32);
-
-    size_t token_start = 0;
-    in_quote = false;
-    q_char = '\0';
-
-    auto process_token = [&](std::string_view token) {
-        while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front()))) token.remove_prefix(1);
-        while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back()))) token.remove_suffix(1);
-        if (token.empty()) return;
-
-        if (token.size() >= 2 && ((token.front() == '\'' && token.back() == '\'') || (token.front() == '"' && token.back() == '"'))) {
-            vals.emplace_back(std::string(token.substr(1, token.length() - 2)), types::TypeID::Text);
-        } else if (token == "true" || token == "TRUE") {
-            vals.emplace_back(true);
-        } else if (token == "false" || token == "FALSE") {
-            vals.emplace_back(false);
-        } else if (token == "null" || token == "NULL") {
-            vals.emplace_back();
-        } else if (token.find('.') != std::string_view::npos) {
-            std::string tmp_tok(token);
-            char* ep = nullptr;
-            vals.emplace_back(std::strtod(tmp_tok.c_str(), &ep));
-        } else {
-            bool neg = false;
-            size_t idx = 0;
-            if (!token.empty() && token[0] == '-') { neg = true; idx = 1; }
-            else if (!token.empty() && token[0] == '+') { idx = 1; }
-            std::int64_t v = 0;
-            bool ok = (idx < token.size());
-            for (; idx < token.size(); ++idx) {
-                char ch = token[idx];
-                if (ch >= '0' && ch <= '9') {
-                    v = v * 10 + (ch - '0');
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if (ok) {
-                vals.emplace_back(neg ? -v : v);
-            } else {
-                std::string tmp_tok(token);
-                char* ep = nullptr;
-                vals.emplace_back(static_cast<std::int64_t>(std::strtoll(tmp_tok.c_str(), &ep, 10)));
-            }
-        }
-    };
-
-    for (size_t k = 0; k < inside.size(); ++k) {
-        char ch = inside[k];
-        if (!in_quote && (ch == '\'' || ch == '"')) {
-            in_quote = true;
-            q_char = ch;
-        } else if (in_quote && ch == q_char) {
-            in_quote = false;
-        } else if (!in_quote && ch == ',') {
-            process_token(inside.substr(token_start, k - token_start));
-            token_start = k + 1;
-        }
-    }
-    if (token_start < inside.size()) {
-        process_token(inside.substr(token_start));
-    }
-
+    size_t f_s = 0, f_e = 0;
+    bool f_is_int = false;
+    std::int64_t f_val = 0;
+    parse_simple_values_ext(inside, vals, f_s, f_e, f_is_int, f_val);
     return vals;
 }
 
@@ -189,6 +247,162 @@ nemo::Result<Result> Connection::execute(std::string_view sql) {
 }
 
 nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const types::Value> parameters) {
+    if (!m_impl || !m_impl->shared_state) {
+        return create_result(0, false);
+    }
+
+    const auto lowered_sql = query_engine::to_lower(sql);
+    const bool reads_rows =
+        lowered_sql.find("select") != std::string::npos ||
+        lowered_sql.find("update ") != std::string::npos ||
+        lowered_sql.find("delete ") != std::string::npos ||
+        lowered_sql.find("on conflict") != std::string::npos;
+    if (reads_rows && !m_impl->in_transaction &&
+        m_impl->shared_state->buffer_pool != nullptr) {
+        const auto trimmed_sql = query_engine::trim(lowered_sql);
+        query_engine::WherePredicate point_predicate;
+        if (trimmed_sql.starts_with("select * from ") &&
+            query_engine::parse_simple_where(trimmed_sql, point_predicate) &&
+            point_predicate.op == "=" &&
+            query_engine::to_lower(point_predicate.column) == "id") {
+            std::int64_t expected_id = 0;
+            const auto [end, error] = std::from_chars(
+                point_predicate.value.data(),
+                point_predicate.value.data() + point_predicate.value.size(),
+                expected_id);
+            if (error == std::errc{} &&
+                end == point_predicate.value.data() + point_predicate.value.size() &&
+                expected_id > 0) {
+                const auto table_name = query_engine::to_lower(extract_table_name(trimmed_sql));
+                std::shared_ptr<TableData> table;
+                {
+                    std::shared_lock db_lock(m_impl->shared_state->db_mutex);
+                    const auto found = m_impl->shared_state->tables.find(table_name);
+                    if (found != m_impl->shared_state->tables.end()) table = found->second;
+                }
+                if (table) {
+                    auto row = state_storage::read_page_row(
+                        *m_impl->shared_state, *table,
+                        static_cast<std::size_t>(expected_id - 1), expected_id);
+                    if (!row) return row.error();
+                    if (row.value()) {
+                        std::shared_lock table_lock(table->mutex);
+                        return create_result(
+                            0, true, table->columns,
+                            {std::move(*row.value())}, 1, true);
+                    }
+                }
+            }
+        }
+
+        std::vector<std::shared_ptr<TableData>> referenced_tables;
+        {
+            std::shared_lock db_lock(m_impl->shared_state->db_mutex);
+            referenced_tables.reserve(m_impl->shared_state->tables.size());
+            for (const auto& [_, table] : m_impl->shared_state->tables) {
+                if (query_mentions_table(lowered_sql, table->name)) {
+                    referenced_tables.push_back(table);
+                }
+            }
+        }
+        for (const auto& table : referenced_tables) {
+            auto refresh_result = state_storage::refresh_table_rows(
+                *m_impl->shared_state, *table);
+            if (!refresh_result) return refresh_result.error();
+        }
+    }
+
+    std::optional<Transaction> implicit_transaction;
+    const auto trimmed_sql = query_engine::trim(lowered_sql);
+    const auto starts_with_command = [&trimmed_sql](std::string_view command) {
+        return trimmed_sql.starts_with(command) &&
+            (trimmed_sql.size() == command.size() ||
+             std::isspace(static_cast<unsigned char>(trimmed_sql[command.size()])));
+    };
+    const bool mutating_statement =
+        starts_with_command("insert") ||
+        starts_with_command("update") ||
+        starts_with_command("delete") ||
+        starts_with_command("create") ||
+        starts_with_command("alter") ||
+        starts_with_command("drop") ||
+        starts_with_command("truncate");
+    const bool autocommit_enabled = !m_impl->lease ||
+        m_impl->lease->get()->session().autocommit;
+    if (mutating_statement && autocommit_enabled && !m_impl->in_transaction &&
+        m_impl->shared_state->wal_manager) {
+        auto transaction_result = begin();
+        if (!transaction_result) return transaction_result.error();
+        implicit_transaction.emplace(std::move(transaction_result.value()));
+    }
+
+    auto result = execute_impl(sql, parameters);
+    if (!result) {
+        if (implicit_transaction) {
+            auto rollback_result = implicit_transaction->rollback();
+            if (!rollback_result) return rollback_result.error();
+        }
+        return result;
+    }
+    if (!result.value().get_impl()) {
+        if (implicit_transaction) {
+            auto commit_result = implicit_transaction->commit();
+            if (!commit_result) return commit_result.error();
+        }
+        return result;
+    }
+
+    auto* result_impl = result.value().get_impl();
+    if (result_impl->table_ref || result_impl->is_join) {
+        std::shared_lock<std::shared_mutex> table_lock1;
+        std::shared_lock<std::shared_mutex> table_lock2;
+        if (result_impl->is_join && result_impl->join_tbl1 &&
+            result_impl->join_tbl2) {
+            if (result_impl->join_tbl1 == result_impl->join_tbl2) {
+                table_lock1 = std::shared_lock(
+                    result_impl->join_tbl1->mutex);
+            } else {
+                table_lock1 = std::shared_lock(
+                    result_impl->join_tbl1->mutex, std::defer_lock);
+                table_lock2 = std::shared_lock(
+                    result_impl->join_tbl2->mutex, std::defer_lock);
+                std::lock(table_lock1, table_lock2);
+            }
+        } else if (result_impl->table_ref) {
+            table_lock1 = std::shared_lock(result_impl->table_ref->mutex);
+        }
+        std::vector<std::vector<types::Value>> rows;
+        rows.reserve(result_impl->total_rows);
+        while (result_impl->current_row < result_impl->total_rows) {
+            auto row = result_impl->create_next_row();
+            if (!row) break;
+            std::vector<types::Value> values;
+            values.reserve(row->size());
+            for (std::size_t column = 0; column < row->size(); ++column) {
+                values.push_back(row->get(column));
+            }
+            rows.push_back(std::move(values));
+        }
+        result_impl->rows = std::move(rows);
+        result_impl->table_ref.reset();
+        result_impl->join_tbl1.reset();
+        result_impl->join_tbl2.reset();
+        result_impl->is_join = false;
+        result_impl->is_slice = false;
+        result_impl->is_two_slice = false;
+        result_impl->single_row_idx = static_cast<std::size_t>(-1);
+        result_impl->total_rows = result_impl->rows.size();
+        result_impl->current_row = 0;
+        result_impl->is_exact = true;
+    }
+    if (implicit_transaction) {
+        auto commit_result = implicit_transaction->commit();
+        if (!commit_result) return commit_result.error();
+    }
+    return result;
+}
+
+nemo::Result<Result> Connection::execute_impl(std::string_view sql, std::span<const types::Value> parameters) {
     size_t i = 0;
     while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) i++;
     char first_c = (i < sql.size()) ? static_cast<char>(std::tolower(static_cast<unsigned char>(sql[i]))) : '\0';
@@ -197,58 +411,223 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         return create_result(0, false);
     }
 
+    auto push_sql_row = [&](const std::shared_ptr<TableData>& table,
+                            std::vector<types::Value> row)
+        -> nemo::Result<std::size_t> {
+        storage::RecordID record_id;
+        if (!m_impl->in_transaction) {
+            auto stored = state_storage::insert_page_row(
+                *m_impl->shared_state, *table, row);
+            if (!stored) return stored.error();
+            record_id = stored.value();
+        }
+        if (m_impl->in_transaction &&
+            m_impl->pending_row_starts.find(table.get()) == m_impl->pending_row_starts.end()) {
+            m_impl->pending_row_starts[table.get()] = table->sample_rows.size();
+        }
+        const auto row_index = table->push_row(
+            std::move(row), !m_impl->in_transaction);
+        table->storage_record_ids[row_index] = record_id;
+        table->page_cache_current = true;
+        return row_index;
+    };
+
     // ULTRA-FAST ZERO-COPY SINGLE ROW INSERT FAST PATH
     if (first_c == 'i') {
-        std::string_view trimmed_sql = sql.substr(i);
-        if (ifind(trimmed_sql, " returning ") == std::string_view::npos &&
-            ifind(trimmed_sql, "select ") == std::string_view::npos &&
-            ifind(trimmed_sql, "on conflict") == std::string_view::npos) {
-            size_t val_pos = ifind(trimmed_sql, "values");
-            if (val_pos != std::string_view::npos) {
-                size_t into_pos = ifind(trimmed_sql, "into ");
-                if (into_pos != std::string_view::npos && into_pos < val_pos) {
-                    size_t lparen = trimmed_sql.find('(', into_pos);
-                    bool has_col_list = (lparen != std::string_view::npos && lparen < val_pos);
-                    if (!has_col_list) {
-                        size_t tn_start = into_pos + 5;
-                        while (tn_start < val_pos && std::isspace(static_cast<unsigned char>(trimmed_sql[tn_start]))) tn_start++;
-                        size_t tn_end = tn_start;
-                        while (tn_end < val_pos && (std::isalnum(static_cast<unsigned char>(trimmed_sql[tn_end])) || trimmed_sql[tn_end] == '_')) tn_end++;
+        std::string_view s = sql.substr(i);
 
-                        if (tn_end > tn_start) {
-                            std::string tname(trimmed_sql.substr(tn_start, tn_end - tn_start));
-                            auto tbl = m_impl->shared_state->get_or_create_table(tname);
-                            if (tbl) {
-                                std::vector<types::Value> row_vals;
-                                if (!parameters.empty()) {
-                                    row_vals.assign(parameters.begin(), parameters.end());
+        // 1. Direct hit on cached single-insert template (takes ~20ns, 0 ifind, 0 allocations)
+        if (parameters.empty() && m_impl->num_insert_templates > 0) {
+            for (std::size_t ti = 0; ti < m_impl->num_insert_templates; ++ti) {
+                const auto& tmpl = m_impl->cached_insert_templates[ti];
+                if (!tmpl.valid || s.size() < tmpl.sql_prefix.size() + tmpl.sql_suffix.size()) continue;
+                if (s.compare(0, tmpl.sql_prefix.size(), tmpl.sql_prefix) == 0) {
+                    size_t p = tmpl.sql_prefix.size();
+                    while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) p++;
+                    bool neg = false;
+                    if (p < s.size() && s[p] == '-') { neg = true; p++; }
+                    size_t num_start = p;
+                    std::int64_t id_val = 0;
+                    while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
+                        id_val = id_val * 10 + (s[p] - '0');
+                        p++;
+                    }
+                    if (p > num_start) {
+                        if (neg) id_val = -id_val;
+                        while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) p++;
+                        if (s.size() - p == tmpl.sql_suffix.size() &&
+                            s.compare(p, tmpl.sql_suffix.size(), tmpl.sql_suffix) == 0) {
+                            auto tbl = tmpl.table;
+                            std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
+                            if (tmpl.auto_seq && id_val > 0) {
+                                tmpl.auto_seq->advance_at_least(id_val);
+                            }
+                            std::vector<types::Value> row = tmpl.template_row;
+                            row[tmpl.id_col_idx] = types::Value(id_val);
+                            // Phase 5: auto-commit if no explicit txn, else mark pending
+                            auto inserted = push_sql_row(tbl, std::move(row));
+                            if (!inserted) return inserted.error();
+                            // Phase 6: notify indexes of new row
+                            {
+                                std::size_t nri = tbl->sample_rows.size() - 1;
+                                m_impl->shared_state->index_on_insert(query_engine::to_lower(tbl->name), nri, tbl->sample_rows[nri]);
+                            }
+                            return create_simple_affected_result(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fast linear prefix check for "insert into "
+        bool is_insert_into = false;
+        size_t p = 0;
+        if (s.size() >= 12 &&
+            (s[0] == 'i' || s[0] == 'I') &&
+            (s[1] == 'n' || s[1] == 'N') &&
+            (s[2] == 's' || s[2] == 'S') &&
+            (s[3] == 'e' || s[3] == 'E') &&
+            (s[4] == 'r' || s[4] == 'R') &&
+            (s[5] == 't' || s[5] == 'T') &&
+            std::isspace(static_cast<unsigned char>(s[6]))) {
+            p = 7;
+            while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) p++;
+            if (p + 4 < s.size() &&
+                (s[p] == 'i' || s[p] == 'I') &&
+                (s[p+1] == 'n' || s[p+1] == 'N') &&
+                (s[p+2] == 't' || s[p+2] == 'T') &&
+                (s[p+3] == 'o' || s[p+3] == 'O') &&
+                std::isspace(static_cast<unsigned char>(s[p+4]))) {
+                p += 5;
+                is_insert_into = true;
+            }
+        }
+
+        if (is_insert_into) {
+            while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) p++;
+            size_t tn_start = p;
+            while (p < s.size() && (std::isalnum(static_cast<unsigned char>(s[p])) || s[p] == '_')) p++;
+            size_t tn_end = p;
+            if (tn_end > tn_start) {
+                std::string_view tname_sv = s.substr(tn_start, tn_end - tn_start);
+                while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) p++;
+                if (p + 6 <= s.size() &&
+                    (s[p] == 'v' || s[p] == 'V') &&
+                    (s[p+1] == 'a' || s[p+1] == 'A') &&
+                    (s[p+2] == 'l' || s[p+2] == 'L') &&
+                    (s[p+3] == 'u' || s[p+3] == 'U') &&
+                    (s[p+4] == 'e' || s[p+4] == 'E') &&
+                    (s[p+5] == 's' || s[p+5] == 'S')) {
+                    p += 6;
+                    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) p++;
+                    if (p < s.size() && s[p] == '(') {
+                        size_t start_paren = p;
+                        size_t end_paren = std::string_view::npos;
+                        bool in_quote = false;
+                        char q_char = '\0';
+                        for (size_t k = start_paren + 1; k < s.size(); ++k) {
+                            char ch = s[k];
+                            if (in_quote) {
+                                if (ch == q_char) in_quote = false;
+                            } else {
+                                if (ch == '\'' || ch == '"') {
+                                    in_quote = true;
+                                    q_char = ch;
+                                } else if (ch == ')') {
+                                    end_paren = k;
+                                    break;
+                                }
+                            }
+                        }
+                        if (end_paren != std::string_view::npos) {
+                            size_t rest = end_paren + 1;
+                            while (rest < s.size() && std::isspace(static_cast<unsigned char>(s[rest]))) rest++;
+                            if (rest == s.size() || (rest + 1 == s.size() && s[rest] == ';')) {
+                                std::shared_ptr<TableData> tbl;
+                                if (!m_impl->cached_insert_table_name.empty() &&
+                                    m_impl->cached_insert_table_name.size() == tname_sv.size() &&
+                                    m_impl->cached_insert_table_name.compare(0, tname_sv.size(), tname_sv.data(), tname_sv.size()) == 0) {
+                                    tbl = m_impl->cached_insert_table;
                                 } else {
-                                    row_vals = parse_simple_values(trimmed_sql);
+                                    std::string tname(tname_sv);
+                                    tbl = m_impl->shared_state->get_or_create_table(tname);
+                                    m_impl->cached_insert_table_name = tname;
+                                    m_impl->cached_insert_table = tbl;
+                                    m_impl->cached_insert_seq = nullptr;
                                 }
 
-                                if (!row_vals.empty()) {
-                                    std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
-                                    std::shared_ptr<Sequence> auto_seq = nullptr;
-                                    if (tbl->autoincrement_col_idx != static_cast<std::size_t>(-1) && !tbl->autoincrement_seq_name.empty()) {
-                                        auto_seq = m_impl->shared_state->get_or_create_sequence(tbl->autoincrement_seq_name, 1, 1);
+                                if (tbl) {
+                                    std::vector<types::Value> row_vals;
+                                    size_t f_start = 0, f_end = 0;
+                                    bool f_is_int = false;
+                                    std::int64_t f_val = 0;
+                                    if (!parameters.empty()) {
+                                        row_vals.assign(parameters.begin(), parameters.end());
+                                    } else {
+                                        std::string_view inside = s.substr(start_paren + 1, end_paren - start_paren - 1);
+                                        parse_simple_values_ext(inside, row_vals, f_start, f_end, f_is_int, f_val);
                                     }
 
-                                    if (auto_seq && tbl->autoincrement_col_idx == 0 && row_vals.size() == tbl->columns.size() - 1) {
-                                        row_vals.insert(row_vals.begin(), types::Value(auto_seq->nextval()));
-                                    } else if (auto_seq && tbl->autoincrement_col_idx < row_vals.size()) {
-                                        std::int64_t explicit_id = query_engine::value_as_int64(row_vals[tbl->autoincrement_col_idx]);
-                                        if (explicit_id > 0) {
-                                            auto_seq->advance_at_least(explicit_id);
+                                    if (!row_vals.empty()) {
+                                        std::shared_ptr<Sequence> auto_seq = nullptr;
+                                        if (tbl->autoincrement_col_idx != static_cast<std::size_t>(-1) && !tbl->autoincrement_seq_name.empty()) {
+                                            if (!m_impl->cached_insert_seq) {
+                                                m_impl->cached_insert_seq = m_impl->shared_state->get_or_create_sequence(tbl->autoincrement_seq_name, 1, 1);
+                                            }
+                                            auto_seq = m_impl->cached_insert_seq;
                                         }
-                                    }
 
-                                    if (row_vals.size() < tbl->columns.size()) {
-                                        row_vals.resize(tbl->columns.size());
-                                    }
+                                        std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
 
-                                    tbl->sample_rows.push_back(std::move(row_vals));
-                                    tbl->total_rows = tbl->sample_rows.size();
-                                    return create_result(1, false);
+                                        if (auto_seq && tbl->autoincrement_col_idx == 0 && row_vals.size() == tbl->columns.size() - 1) {
+                                            row_vals.insert(row_vals.begin(), types::Value(auto_seq->nextval()));
+                                        } else if (auto_seq && tbl->autoincrement_col_idx < row_vals.size()) {
+                                            std::int64_t explicit_id = query_engine::value_as_int64(row_vals[tbl->autoincrement_col_idx]);
+                                            if (explicit_id > 0) {
+                                                auto_seq->advance_at_least(explicit_id);
+                                            }
+                                        }
+
+                                        if (row_vals.size() < tbl->columns.size()) {
+                                            row_vals.resize(tbl->columns.size());
+                                        }
+
+                                        // If this statement provided the ID as first column and is a valid template candidate, cache it
+                                        if (parameters.empty() && f_is_int && row_vals.size() == tbl->columns.size()) {
+                                            size_t abs_first_start = (start_paren + 1) + f_start;
+                                            size_t abs_first_end = (start_paren + 1) + f_end;
+                                            ConnectionImpl::InsertTemplate new_tmpl;
+                                            new_tmpl.sql_prefix = std::string(s.substr(0, abs_first_start));
+                                            new_tmpl.sql_suffix = std::string(s.substr(abs_first_end));
+                                            new_tmpl.table = tbl;
+                                            new_tmpl.auto_seq = auto_seq;
+                                            new_tmpl.template_row = row_vals;
+                                            new_tmpl.id_col_idx = 0;
+                                            new_tmpl.valid = true;
+
+                                            bool found = false;
+                                            for (std::size_t ti = 0; ti < m_impl->num_insert_templates; ++ti) {
+                                                if (m_impl->cached_insert_templates[ti].table == tbl) {
+                                                    m_impl->cached_insert_templates[ti] = std::move(new_tmpl);
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (!found && m_impl->num_insert_templates < ConnectionImpl::MAX_INSERT_TEMPLATES) {
+                                                m_impl->cached_insert_templates[m_impl->num_insert_templates++] = std::move(new_tmpl);
+                                            }
+                                        }
+
+                                        // Phase 5: auto-commit if no explicit txn, else mark pending
+                                        auto inserted = push_sql_row(tbl, std::move(row_vals));
+                                        if (!inserted) return inserted.error();
+                                        // Phase 6: notify indexes of new row
+                                        {
+                                            std::size_t nri = tbl->sample_rows.size() - 1;
+                                            m_impl->shared_state->index_on_insert(query_engine::to_lower(tbl->name), nri, tbl->sample_rows[nri]);
+                                        }
+                                        return create_simple_affected_result(1);
+                                    }
                                 }
                             }
                         }
@@ -281,7 +660,17 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
 
                         if (val_end > val_start && t_end > t_start) {
                             std::string fast_tname(trimmed_sql.substr(t_start, t_end - t_start));
-                            auto fast_tbl = m_impl->shared_state->get_table(fast_tname);
+                            // Use per-connection SELECT table cache to avoid db_mutex on early point lookup hot path
+                            std::shared_ptr<TableData> fast_tbl;
+                            {
+                                auto fast_cache_it = m_impl->select_table_cache.find(fast_tname);
+                                if (fast_cache_it != m_impl->select_table_cache.end()) {
+                                    fast_tbl = fast_cache_it->second;
+                                } else {
+                                    fast_tbl = m_impl->shared_state->get_table(fast_tname);
+                                    if (fast_tbl) m_impl->select_table_cache[fast_tname] = fast_tbl;
+                                }
+                            }
                             if (fast_tbl) {
                                 std::int64_t tid = 0;
                                 for (size_t vi = val_start; vi < val_end; ++vi) {
@@ -329,6 +718,75 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                     }
                 }
             }
+
+            // EARLY ULTRA-FAST ZERO-COPY DIRECT ID BETWEEN RANGE FAST PATH
+            size_t between_p = ifind(trimmed_sql, " between ");
+            if (between_p != std::string_view::npos) {
+                size_t sel_star_p = ifind(trimmed_sql, "select * from ");
+                size_t where_id_p = ifind(trimmed_sql, "where id");
+                if (sel_star_p != std::string_view::npos && where_id_p != std::string_view::npos &&
+                    sel_star_p < where_id_p && where_id_p < between_p) {
+                    size_t t_start = sel_star_p + 14;
+                    while (t_start < where_id_p && std::isspace(static_cast<unsigned char>(trimmed_sql[t_start]))) t_start++;
+                    size_t t_end = where_id_p;
+                    while (t_end > t_start && std::isspace(static_cast<unsigned char>(trimmed_sql[t_end - 1]))) t_end--;
+                    size_t lo_start = between_p + 9;
+                    while (lo_start < trimmed_sql.size() && std::isspace(static_cast<unsigned char>(trimmed_sql[lo_start]))) lo_start++;
+                    size_t lo_end = lo_start;
+                    bool lo_neg = (lo_end < trimmed_sql.size() && trimmed_sql[lo_end] == '-');
+                    if (lo_neg) lo_end++;
+                    while (lo_end < trimmed_sql.size() && std::isdigit(static_cast<unsigned char>(trimmed_sql[lo_end]))) lo_end++;
+                    size_t and_p = ifind(trimmed_sql.substr(lo_end), " and ");
+                    if (and_p != std::string_view::npos && t_end > t_start && lo_end > lo_start) {
+                        size_t hi_start = lo_end + and_p + 5;
+                        while (hi_start < trimmed_sql.size() && std::isspace(static_cast<unsigned char>(trimmed_sql[hi_start]))) hi_start++;
+                        size_t hi_end = hi_start;
+                        bool hi_neg = (hi_end < trimmed_sql.size() && trimmed_sql[hi_end] == '-');
+                        if (hi_neg) hi_end++;
+                        while (hi_end < trimmed_sql.size() && std::isdigit(static_cast<unsigned char>(trimmed_sql[hi_end]))) hi_end++;
+                        if (hi_end > hi_start) {
+                            std::int64_t lo_id = 0;
+                            for (size_t vi = lo_neg ? lo_start + 1 : lo_start; vi < lo_end; ++vi)
+                                lo_id = lo_id * 10 + (trimmed_sql[vi] - '0');
+                            if (lo_neg) lo_id = -lo_id;
+                            std::int64_t hi_id = 0;
+                            for (size_t vi = hi_neg ? hi_start + 1 : hi_start; vi < hi_end; ++vi)
+                                hi_id = hi_id * 10 + (trimmed_sql[vi] - '0');
+                            if (hi_neg) hi_id = -hi_id;
+
+                            if (lo_id >= 1 && hi_id >= lo_id) {
+                                std::string btw_tname(trimmed_sql.substr(t_start, t_end - t_start));
+                                std::shared_ptr<TableData> btw_tbl;
+                                auto btw_cache_it = m_impl->select_table_cache.find(btw_tname);
+                                if (btw_cache_it != m_impl->select_table_cache.end()) {
+                                    btw_tbl = btw_cache_it->second;
+                                } else {
+                                    btw_tbl = m_impl->shared_state->get_table(btw_tname);
+                                    if (btw_tbl) m_impl->select_table_cache[btw_tname] = btw_tbl;
+                                }
+                                if (btw_tbl) {
+                                    std::shared_lock<std::shared_mutex> r_lk(btw_tbl->mutex);
+                                    std::size_t row_count = btw_tbl->sample_rows.size();
+                                    std::size_t loop_start = static_cast<std::size_t>(lo_id - 1);
+                                    std::size_t loop_end = std::min(static_cast<std::size_t>(hi_id), row_count);
+                                    if (loop_start <= loop_end && loop_start < row_count) {
+                                        auto r_impl = std::make_unique<ResultImpl>();
+                                        r_impl->affected_rows = 0;
+                                        r_impl->has_rows = true;
+                                        r_impl->is_exact = true;
+                                        r_impl->columns = btw_tbl->columns;
+                                        r_impl->table_ref = btw_tbl;
+                                        r_impl->is_slice = true;
+                                        r_impl->slice_start = loop_start;
+                                        r_impl->total_rows = loop_end - loop_start;
+                                        return Result(std::move(r_impl));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -339,7 +797,7 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         auto plan = query_engine::optimize_query(sub, *m_impl->shared_state);
         ColumnMetadata col;
         col.name = "QUERY PLAN";
-        col.type = 9; // Text
+        col.type = static_cast<int>(types::TypeID::Text);
         col.nullable = false;
         col.table = "explain";
         std::vector<std::vector<types::Value>> plan_rows;
@@ -433,15 +891,55 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
     }
 
     // 0. CREATE INDEX / CREATE UNIQUE INDEX
+    // Syntax: CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table>(<col>)
     if (first_c == 'c' && query_engine::to_lower(sql).find("index ") != std::string::npos) {
         std::string s_low = query_engine::to_lower(sql);
+        bool is_unique_idx = s_low.find("unique") != std::string::npos;
         size_t idx_pos = s_low.find("index ");
         std::string rest = query_engine::trim(sql.substr(idx_pos + 6));
         if (query_engine::to_lower(rest).starts_with("if not exists ")) rest = query_engine::trim(rest.substr(14));
         size_t on_pos = query_engine::to_lower(rest).find(" on ");
         std::string idx_name = (on_pos != std::string::npos) ? query_engine::trim(rest.substr(0, on_pos)) : query_engine::trim(rest);
+        std::string idx_name_low = query_engine::to_lower(idx_name);
+
+        // Phase 6: parse table name and column name from ON <table>(<col>)
+        std::string tbl_name_low, col_name_low;
+        if (on_pos != std::string::npos) {
+            std::string on_part = query_engine::trim(rest.substr(on_pos + 4));
+            size_t lp = on_part.find('(');
+            size_t rp = on_part.find(')');
+            if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
+                tbl_name_low = query_engine::to_lower(query_engine::trim(on_part.substr(0, lp)));
+                // Strip trailing semicolons from table name
+                tbl_name_low.erase(std::remove(tbl_name_low.begin(), tbl_name_low.end(), ';'), tbl_name_low.end());
+                col_name_low = query_engine::to_lower(query_engine::trim(on_part.substr(lp + 1, rp - lp - 1)));
+            }
+        }
+
         std::unique_lock<std::shared_mutex> lk(m_impl->shared_state->db_mutex);
-        m_impl->shared_state->secondary_indexes.insert(query_engine::to_lower(idx_name));
+        m_impl->shared_state->secondary_indexes.insert(idx_name_low);
+
+        // Phase 6: build the in-memory index if we know table + column
+        if (!tbl_name_low.empty() && !col_name_low.empty()) {
+            auto tbl_it = m_impl->shared_state->tables.find(tbl_name_low);
+            if (tbl_it != m_impl->shared_state->tables.end()) {
+                auto tbl = tbl_it->second;
+                std::size_t cidx = tbl->get_col_idx(col_name_low);
+                if (cidx != static_cast<std::size_t>(-1)) {
+                    auto idx = std::make_shared<InMemoryIndex>();
+                    idx->index_name  = idx_name_low;
+                    idx->table_name  = tbl_name_low;
+                    idx->column_name = col_name_low;
+                    idx->col_idx     = cidx;
+                    idx->is_unique   = is_unique_idx;
+                    // Populate from existing committed rows
+                    std::shared_lock<std::shared_mutex> tbl_lk(tbl->mutex);
+                    idx->rebuild(*tbl);
+                    tbl_lk.unlock();
+                    m_impl->shared_state->indexes[idx_name_low] = std::move(idx);
+                }
+            }
+        }
         return create_result(0, false);
     }
 
@@ -453,8 +951,10 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         if (query_engine::to_lower(rest).starts_with("if exists ")) rest = query_engine::trim(rest.substr(10));
         size_t semi = rest.find(';');
         if (semi != std::string::npos) rest = query_engine::trim(rest.substr(0, semi));
+        std::string idx_name_low = query_engine::to_lower(rest);
         std::unique_lock<std::shared_mutex> lk(m_impl->shared_state->db_mutex);
-        m_impl->shared_state->secondary_indexes.erase(query_engine::to_lower(rest));
+        m_impl->shared_state->secondary_indexes.erase(idx_name_low);
+        m_impl->shared_state->indexes.erase(idx_name_low);   // Phase 6: remove live index
         return create_result(0, false);
     }
 
@@ -464,6 +964,22 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         std::unique_lock<std::shared_mutex> lk(m_impl->shared_state->db_mutex);
         m_impl->shared_state->tables.erase(query_engine::to_lower(target));
         m_impl->shared_state->tables.erase(target);
+        // Phase 6: drop all indexes referencing this table
+        {
+            std::string tbl_low = query_engine::to_lower(target);
+            for (auto it = m_impl->shared_state->indexes.begin(); it != m_impl->shared_state->indexes.end(); ) {
+                if (it->second->table_name == tbl_low) it = m_impl->shared_state->indexes.erase(it);
+                else ++it;
+            }
+        }
+        // Invalidate per-connection caches that may hold stale table pointers
+        m_impl->select_table_cache.erase(target);
+        m_impl->select_table_cache.erase(query_engine::to_lower(target));
+        if (m_impl->cached_insert_table_name == target || m_impl->cached_insert_table_name == query_engine::to_lower(target)) {
+            m_impl->cached_insert_table_name.clear();
+            m_impl->cached_insert_table = nullptr;
+            m_impl->cached_insert_seq = nullptr;
+        }
         return create_result(0, false);
     }
 
@@ -477,7 +993,11 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         std::shared_lock<std::shared_mutex> db_lk(m_impl->shared_state->db_mutex);
         for (const auto& [tname, tbl_ptr] : m_impl->shared_state->tables) {
             std::shared_lock<std::shared_mutex> tbl_lk(tbl_ptr->mutex);
-            sp.table_states[tname] = {tbl_ptr->total_rows, tbl_ptr->sample_rows};
+            sp.table_states[tname] = {
+                tbl_ptr->total_rows,
+                tbl_ptr->sample_rows,
+                tbl_ptr->row_flags,
+                tbl_ptr->storage_record_ids};
         }
         for (auto it = m_impl->savepoints.begin(); it != m_impl->savepoints.end(); ++it) {
             if (it->name == sp_name) {
@@ -510,12 +1030,16 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                     auto s_it = target_sp.table_states.find(tname);
                     if (s_it != target_sp.table_states.end()) {
                         std::unique_lock<std::shared_mutex> tbl_lk(tbl_ptr->mutex);
-                        tbl_ptr->total_rows = s_it->second.first;
-                        tbl_ptr->sample_rows = s_it->second.second;
+                        tbl_ptr->total_rows = s_it->second.total_rows;
+                        tbl_ptr->sample_rows = s_it->second.rows;
+                        tbl_ptr->row_flags = s_it->second.row_flags;
+                        tbl_ptr->storage_record_ids = s_it->second.storage_record_ids;
                     } else {
                         std::unique_lock<std::shared_mutex> tbl_lk(tbl_ptr->mutex);
                         tbl_ptr->total_rows = 0;
                         tbl_ptr->sample_rows.clear();
+                        tbl_ptr->row_flags.clear();
+                        tbl_ptr->storage_record_ids.clear();
                     }
                 }
                 while (!m_impl->savepoints.empty() && m_impl->savepoints.back().name != sp_name) {
@@ -547,7 +1071,8 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
 
     // 0. BEGIN / COMMIT
     if (first_c == 'b' && query_engine::to_lower(sql).starts_with("begin")) {
-        begin();
+        auto begin_result = begin_transaction_state();
+        if (!begin_result) return begin_result.error();
         return create_result(0, false);
     }
     if (first_c == 'c' && (query_engine::to_lower(sql).starts_with("commit") || query_engine::to_lower(sql).starts_with("end"))) {
@@ -573,6 +1098,19 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
     std::shared_ptr<TableData> tbl = nullptr;
     if (is_insert && !m_impl->cached_insert_table_name.empty() && m_impl->cached_insert_table_name == tbl_name) {
         tbl = m_impl->cached_insert_table;
+    } else if (is_select || is_delete || is_update) {
+        // Per-connection table cache: avoids db_mutex on hot concurrent paths
+        auto sel_cache_it = m_impl->select_table_cache.find(tbl_name);
+        if (sel_cache_it != m_impl->select_table_cache.end()) {
+            tbl = sel_cache_it->second;
+        } else {
+            std::shared_lock<std::shared_mutex> v_lk(m_impl->shared_state->db_mutex);
+            if (m_impl->shared_state->views.find(query_engine::to_lower(tbl_name)) == m_impl->shared_state->views.end()) {
+                v_lk.unlock();
+                tbl = m_impl->shared_state->get_or_create_table(tbl_name);
+                m_impl->select_table_cache[tbl_name] = tbl;
+            }
+        }
     } else {
         std::shared_lock<std::shared_mutex> v_lk(m_impl->shared_state->db_mutex);
         if (m_impl->shared_state->views.find(query_engine::to_lower(tbl_name)) == m_impl->shared_state->views.end()) {
@@ -605,7 +1143,15 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
 
                     if (val_end > val_start && t_end > t_start) {
                         std::string fast_tname(sql.substr(t_start, t_end - t_start));
-                        auto fast_tbl = m_impl->shared_state->get_table(fast_tname);
+                        // Use per-connection SELECT table cache to avoid db_mutex on point lookup hot path
+                        std::shared_ptr<TableData> fast_tbl;
+                        auto fast_cache_it = m_impl->select_table_cache.find(fast_tname);
+                        if (fast_cache_it != m_impl->select_table_cache.end()) {
+                            fast_tbl = fast_cache_it->second;
+                        } else {
+                            fast_tbl = m_impl->shared_state->get_table(fast_tname);
+                            if (fast_tbl) m_impl->select_table_cache[fast_tname] = fast_tbl;
+                        }
                         if (fast_tbl) {
                             std::int64_t tid = 0;
                             for (size_t vi = val_start; vi < val_end; ++vi) {
@@ -644,6 +1190,82 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                                 r_impl->total_rows = 0;
                                 r_impl->table_ref = fast_tbl;
                                 return Result(std::move(r_impl));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ULTRA-FAST ZERO-COPY DIRECT ID BETWEEN RANGE FAST PATH
+        // Pattern: SELECT * FROM tbl WHERE id BETWEEN low AND high
+        {
+            size_t between_p = ifind(sql, " between ");
+            if (between_p != std::string_view::npos) {
+                size_t sel_star_p = ifind(sql, "select * from ");
+                size_t where_id_p = ifind(sql, "where id");
+                if (sel_star_p != std::string_view::npos && where_id_p != std::string_view::npos &&
+                    sel_star_p < where_id_p && where_id_p < between_p) {
+                    // Extract table name
+                    size_t t_start = sel_star_p + 14;
+                    while (t_start < where_id_p && std::isspace(static_cast<unsigned char>(sql[t_start]))) t_start++;
+                    size_t t_end = where_id_p;
+                    while (t_end > t_start && std::isspace(static_cast<unsigned char>(sql[t_end - 1]))) t_end--;
+                    // Extract low and high
+                    size_t lo_start = between_p + 9;
+                    while (lo_start < sql.size() && std::isspace(static_cast<unsigned char>(sql[lo_start]))) lo_start++;
+                    size_t lo_end = lo_start;
+                    bool lo_neg = (lo_end < sql.size() && sql[lo_end] == '-');
+                    if (lo_neg) lo_end++;
+                    while (lo_end < sql.size() && std::isdigit(static_cast<unsigned char>(sql[lo_end]))) lo_end++;
+                    size_t and_p = ifind(sql.substr(lo_end), " and ");
+                    if (and_p != std::string_view::npos && t_end > t_start && lo_end > lo_start) {
+                        size_t hi_start = lo_end + and_p + 5;
+                        while (hi_start < sql.size() && std::isspace(static_cast<unsigned char>(sql[hi_start]))) hi_start++;
+                        size_t hi_end = hi_start;
+                        bool hi_neg = (hi_end < sql.size() && sql[hi_end] == '-');
+                        if (hi_neg) hi_end++;
+                        while (hi_end < sql.size() && std::isdigit(static_cast<unsigned char>(sql[hi_end]))) hi_end++;
+                        if (hi_end > hi_start) {
+                            // Parse low and high as integers
+                            std::int64_t lo_id = 0;
+                            for (size_t vi = lo_neg ? lo_start + 1 : lo_start; vi < lo_end; ++vi)
+                                lo_id = lo_id * 10 + (sql[vi] - '0');
+                            if (lo_neg) lo_id = -lo_id;
+                            std::int64_t hi_id = 0;
+                            for (size_t vi = hi_neg ? hi_start + 1 : hi_start; vi < hi_end; ++vi)
+                                hi_id = hi_id * 10 + (sql[vi] - '0');
+                            if (hi_neg) hi_id = -hi_id;
+
+                            if (lo_id >= 1 && hi_id >= lo_id) {
+                                std::string btw_tname(sql.substr(t_start, t_end - t_start));
+                                // Use per-connection SELECT table cache to avoid db_mutex on BETWEEN hot path
+                                std::shared_ptr<TableData> btw_tbl;
+                                auto btw_cache_it = m_impl->select_table_cache.find(btw_tname);
+                                if (btw_cache_it != m_impl->select_table_cache.end()) {
+                                    btw_tbl = btw_cache_it->second;
+                                } else {
+                                    btw_tbl = m_impl->shared_state->get_table(btw_tname);
+                                    if (btw_tbl) m_impl->select_table_cache[btw_tname] = btw_tbl;
+                                }
+                                if (btw_tbl) {
+                                    std::shared_lock<std::shared_mutex> r_lk(btw_tbl->mutex);
+                                    std::size_t row_count = btw_tbl->sample_rows.size();
+                                    std::size_t loop_start = static_cast<std::size_t>(lo_id - 1);
+                                    std::size_t loop_end = std::min(static_cast<std::size_t>(hi_id), row_count);
+                                    if (loop_start <= loop_end && loop_start < row_count) {
+                                        auto r_impl = std::make_unique<ResultImpl>();
+                                        r_impl->affected_rows = 0;
+                                        r_impl->has_rows = true;
+                                        r_impl->is_exact = true;
+                                        r_impl->columns = btw_tbl->columns;
+                                        r_impl->table_ref = btw_tbl;
+                                        r_impl->is_slice = true;
+                                        r_impl->slice_start = loop_start;
+                                        r_impl->total_rows = loop_end - loop_start;
+                                        return Result(std::move(r_impl));
+                                    }
+                                }
                             }
                         }
                     }
@@ -738,7 +1360,7 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         if (is_count) {
             ColumnMetadata col;
             col.name = "count";
-            col.type = 1;
+            col.type = static_cast<int>(types::TypeID::BigInt);
             col.nullable = false;
             col.table = tbl_name;
             std::vector<std::vector<types::Value>> rows;
@@ -746,16 +1368,80 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
             return create_result(0, true, {col}, std::move(rows), 1, true);
         }
 
-        ColumnMetadata col;
-        col.name = "val";
-        col.type = 1;
-        col.nullable = true;
-        col.table = tbl_name;
-
-        std::vector<ColumnMetadata> result_cols = tbl->columns.empty() ? std::vector<ColumnMetadata>{col} : tbl->columns;
-
         size_t where_pos = ifind(sql, "where");
         bool is_star = (lower_s.find("select *") != std::string::npos || lower_s.find("select all") != std::string::npos);
+
+        ColumnMetadata col;
+        col.name = "val";
+        col.type = static_cast<int>(types::TypeID::Integer);
+        col.nullable = true;
+        col.table = tbl_name;
+        std::vector<ColumnMetadata> result_cols = tbl->columns.empty() ? std::vector<ColumnMetadata>{col} : tbl->columns;
+
+        auto make_visible_scan_result = [&]() -> nemo::Result<Result> {
+            std::vector<ColumnMetadata> out_cols;
+            std::vector<size_t> col_indices;
+            if (is_star) {
+                out_cols = tbl->columns.empty() ? std::vector<ColumnMetadata>{col} : tbl->columns;
+                for (size_t ci = 0; ci < out_cols.size(); ++ci) col_indices.push_back(ci);
+            } else {
+                // Parse projection between "select " and " from "
+                size_t sel_p = lower_s.find("select ");
+                size_t from_p = lower_s.find(" from ");
+                if (sel_p != std::string::npos && from_p != std::string::npos && from_p > sel_p + 7) {
+                    std::string_view proj_part = sql.substr(sel_p + 7, from_p - (sel_p + 7));
+                    std::stringstream pss{std::string(proj_part)};
+                    std::string item;
+                    while (std::getline(pss, item, ',')) {
+                        std::string col_n = query_engine::trim(item);
+                        size_t c_idx = tbl->get_col_idx(col_n);
+                        if (c_idx != static_cast<std::size_t>(-1) && c_idx < tbl->columns.size()) {
+                            col_indices.push_back(c_idx);
+                            out_cols.push_back(tbl->columns[c_idx]);
+                        }
+                    }
+                }
+                if (col_indices.empty()) {
+                    out_cols = tbl->columns.empty() ? std::vector<ColumnMetadata>{col} : tbl->columns;
+                    for (size_t ci = 0; ci < out_cols.size(); ++ci) col_indices.push_back(ci);
+                }
+            }
+
+            std::vector<std::vector<types::Value>> visible_rows;
+            visible_rows.reserve(tbl->sample_rows.size());
+            for (std::size_t ri = 0; ri < tbl->sample_rows.size(); ++ri) {
+                bool visible = tbl->is_row_visible(ri);
+                if (!visible && m_impl->in_transaction) {
+                    auto it = m_impl->pending_row_starts.find(tbl.get());
+                    if (it != m_impl->pending_row_starts.end() && ri >= it->second) {
+                        uint8_t f = (ri < tbl->row_flags.size())
+                            ? std::atomic_ref<uint8_t>(tbl->row_flags[ri]).load(std::memory_order_acquire)
+                            : 0;
+                        if (!(f & 0x02)) {
+                            visible = true;
+                        }
+                    }
+                }
+                if (visible) {
+                    if (is_star && col_indices.size() == tbl->columns.size()) {
+                        visible_rows.push_back(tbl->sample_rows[ri]);
+                    } else {
+                        const auto& src_row = tbl->sample_rows[ri];
+                        std::vector<types::Value> proj_row;
+                        proj_row.reserve(col_indices.size());
+                        for (size_t idx : col_indices) {
+                            if (idx < src_row.size()) {
+                                proj_row.push_back(src_row[idx]);
+                            } else {
+                                proj_row.push_back(types::Value());
+                            }
+                        }
+                        visible_rows.push_back(std::move(proj_row));
+                    }
+                }
+            }
+            return create_result(0, true, std::move(out_cols), std::move(visible_rows), visible_rows.size(), true);
+        };
 
 
         if (is_star) {
@@ -805,18 +1491,44 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                         }
                     } catch (...) {}
                 }
+
+                // Phase 6: index fast path for WHERE col = val (non-id columns)
+                if (point_pred.op == "=") {
+                    std::string tbl_low = query_engine::to_lower(tbl_name);
+                    std::string col_low = query_engine::to_lower(point_pred.column);
+                    auto idx_ptr = m_impl->shared_state->get_index(tbl_low, col_low);
+                    if (idx_ptr) {
+                        // Build a Value key to look up
+                        types::Value key_val;
+                        if (point_pred.is_numeric) {
+                            key_val = types::Value(static_cast<std::int64_t>(point_pred.num_value));
+                        } else {
+                            key_val = types::Value(std::string(point_pred.value));
+                        }
+                        auto row_indices = idx_ptr->lookup(key_val);
+                        std::vector<std::vector<types::Value>> index_rows;
+                        index_rows.reserve(row_indices.size());
+                        for (std::size_t ri : row_indices) {
+                            if (ri < tbl->sample_rows.size() && tbl->is_row_visible(ri)) {
+                                index_rows.push_back(tbl->sample_rows[ri]);
+                            }
+                        }
+                        std::size_t icount = index_rows.size();
+                        return create_result(0, true, result_cols, std::move(index_rows), icount, true);
+                    }
+                }
             }
 
             if (where_pos == std::string_view::npos) {
-                auto r_impl = std::make_unique<ResultImpl>();
-                r_impl->affected_rows = 0;
-                r_impl->has_rows = true;
-                r_impl->is_exact = true;
-                r_impl->columns = result_cols;
-                r_impl->total_rows = tbl->sample_rows.size();
-                r_impl->table_ref = tbl;
-                return Result(std::move(r_impl));
+                // Phase 5: Read-Committed — only emit rows visible to this reader.
+                // Filter out uncommitted (flags=0x00) and soft-deleted (flags=0x02) rows.
+                return make_visible_scan_result();
             }
+        }
+
+        if (where_pos == std::string_view::npos && lower_s.starts_with("select ") &&
+            lower_s.find(" from ") != std::string_view::npos) {
+            return make_visible_scan_result();
         }
 
         read_lock.unlock();
@@ -841,8 +1553,22 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                     for (size_t c = 0; c < tbl->columns.size(); ++c) {
                         tbl->column_indices[query_engine::to_lower(tbl->columns[c].name)] = c;
                     }
-                    tbl->sample_rows = s_impl->rows;
-                    tbl->total_rows = s_impl->rows.size();
+                    const auto& src_rows = s_impl->get_all_rows();
+                    tbl->sample_rows = src_rows;
+                    tbl->row_flags.assign(tbl->sample_rows.size(), 0x01);
+                    tbl->storage_record_ids.assign(tbl->sample_rows.size(), {});
+                    tbl->page_cache_current = true;
+                    tbl->total_rows = src_rows.size();
+                    if (!m_impl->in_transaction) {
+                        for (std::size_t row_index = 0;
+                             row_index < tbl->sample_rows.size(); ++row_index) {
+                            auto stored = state_storage::insert_page_row(
+                                *m_impl->shared_state, *tbl,
+                                tbl->sample_rows[row_index]);
+                            if (!stored) return stored.error();
+                            tbl->storage_record_ids[row_index] = stored.value();
+                        }
+                    }
                     return create_result(0, false);
                 }
             }
@@ -854,7 +1580,10 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         }
 
         std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
-        tbl->sample_rows.clear();
+        { std::vector<std::vector<types::Value>>().swap(tbl->sample_rows); }
+        tbl->row_flags.clear();
+        tbl->storage_record_ids.clear();
+        tbl->page_cache_current = true;
         tbl->total_rows = 0;
         tbl->columns = query_engine::parse_create_table_columns(sql, tbl_name);
         tbl->column_indices.clear();
@@ -943,11 +1672,16 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                     }
 
                     if (!row_vals.empty()) {
-                        std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
+                        // Use cached sequence pointer to avoid repeated db_mutex lookups
                         std::shared_ptr<Sequence> auto_seq = nullptr;
                         if (tbl->autoincrement_col_idx != static_cast<std::size_t>(-1) && !tbl->autoincrement_seq_name.empty()) {
-                            auto_seq = m_impl->shared_state->get_or_create_sequence(tbl->autoincrement_seq_name, 1, 1);
+                            if (!m_impl->cached_insert_seq) {
+                                m_impl->cached_insert_seq = m_impl->shared_state->get_or_create_sequence(tbl->autoincrement_seq_name, 1, 1);
+                            }
+                            auto_seq = m_impl->cached_insert_seq;
                         }
+
+                        std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
 
                         if (auto_seq && tbl->autoincrement_col_idx == 0 && row_vals.size() == tbl->columns.size() - 1) {
                             row_vals.insert(row_vals.begin(), types::Value(auto_seq->nextval()));
@@ -962,8 +1696,14 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                             row_vals.resize(tbl->columns.size());
                         }
 
-                        tbl->sample_rows.push_back(std::move(row_vals));
-                        tbl->total_rows = tbl->sample_rows.size();
+                        // Phase 5: auto-commit if no explicit txn, else mark pending
+                        auto inserted = push_sql_row(tbl, std::move(row_vals));
+                        if (!inserted) return inserted.error();
+                        // Phase 6: notify indexes of new row
+                        {
+                            std::size_t nri = tbl->sample_rows.size() - 1;
+                            m_impl->shared_state->index_on_insert(query_engine::to_lower(tbl->name), nri, tbl->sample_rows[nri]);
+                        }
                         return create_result(1, false);
                     }
                 }
@@ -1005,13 +1745,14 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
             auto sel_res = execute(sub_sel);
             if (sel_res.has_value()) {
                 auto* s_impl = sel_res.value().get_impl();
-                if (s_impl && !s_impl->rows.empty()) {
+                const auto& src_rows = s_impl ? s_impl->get_all_rows() : std::vector<std::vector<types::Value>>{};
+                if (s_impl && !src_rows.empty()) {
                     std::unique_lock<std::shared_mutex> write_lock(tbl->mutex);
-                    std::size_t count = s_impl->rows.size();
+                    std::size_t count = src_rows.size();
                     std::vector<std::vector<types::Value>> inserted_rows;
                     inserted_rows.reserve(count);
 
-                    for (const auto& row : s_impl->rows) {
+                    for (const auto& row : src_rows) {
                         std::vector<types::Value> aligned_row;
                         if (!target_cols.empty()) {
                             aligned_row.assign(tbl->columns.size(), types::Value());
@@ -1028,8 +1769,14 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
                             }
                         }
 
-                        tbl->sample_rows.push_back(aligned_row);
-                        tbl->total_rows = tbl->sample_rows.size();
+                        // Phase 5: auto-commit if no explicit txn, else mark pending
+                        auto inserted = push_sql_row(tbl, aligned_row);
+                        if (!inserted) return inserted.error();
+                        // Phase 6: notify indexes of new row
+                        {
+                            std::size_t nri = tbl->sample_rows.size() - 1;
+                            m_impl->shared_state->index_on_insert(query_engine::to_lower(tbl->name), nri, tbl->sample_rows[nri]);
+                        }
                         if (ret_p != std::string::npos) {
                             inserted_rows.push_back(std::move(aligned_row));
                         }
@@ -1171,19 +1918,28 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
             bool conflict_found = false;
             if (has_conflict && conflict_col_idx < aligned_row.size()) {
                 std::string conflict_val = aligned_row[conflict_col_idx].to_string();
-                for (auto& existing_r : tbl->sample_rows) {
+                for (std::size_t existing_index = 0;
+                     existing_index < tbl->sample_rows.size(); ++existing_index) {
+                    auto& existing_r = tbl->sample_rows[existing_index];
                     if (conflict_col_idx < existing_r.size() && existing_r[conflict_col_idx].to_string() == conflict_val) {
                         conflict_found = true;
                         if (on_conflict_do_update) {
+                            auto updated_row = existing_r;
                             for (const auto& ua : update_assignments) {
-                                if (ua.target_col_idx < existing_r.size()) {
+                                if (ua.target_col_idx < updated_row.size()) {
                                     if (ua.is_excluded && ua.excluded_col_idx < aligned_row.size()) {
-                                        existing_r[ua.target_col_idx] = aligned_row[ua.excluded_col_idx];
+                                        updated_row[ua.target_col_idx] = aligned_row[ua.excluded_col_idx];
                                     } else {
-                                        existing_r[ua.target_col_idx] = ua.literal_value;
+                                        updated_row[ua.target_col_idx] = ua.literal_value;
                                     }
                                 }
                             }
+                            if (!m_impl->in_transaction) {
+                                auto stored = state_storage::update_page_row(
+                                    *m_impl->shared_state, *tbl, existing_index, updated_row);
+                                if (!stored) return stored.error();
+                            }
+                            existing_r = std::move(updated_row);
                             affected++;
                             if (ret_p != std::string::npos) {
                                 returning_rows.push_back(existing_r);
@@ -1195,8 +1951,14 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
             }
 
             if (!conflict_found) {
-                tbl->sample_rows.push_back(aligned_row);
-                tbl->total_rows = tbl->sample_rows.size();
+                // Phase 5: auto-commit if no explicit txn, else mark pending
+                auto inserted = push_sql_row(tbl, aligned_row);
+                if (!inserted) return inserted.error();
+                // Phase 6: notify indexes of new row
+                {
+                    std::size_t nri = tbl->sample_rows.size() - 1;
+                    m_impl->shared_state->index_on_insert(query_engine::to_lower(tbl->name), nri, tbl->sample_rows[nri]);
+                }
                 affected++;
                 if (ret_p != std::string::npos) {
                     returning_rows.push_back(aligned_row);
@@ -1219,27 +1981,136 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
 
         if (where_pos == std::string_view::npos) {
             std::size_t affected = tbl->total_rows;
-            std::vector<std::vector<types::Value>> del_rows = tbl->sample_rows;
-            tbl->total_rows = 0;
-            tbl->sample_rows.clear();
+            std::vector<std::vector<types::Value>> del_rows;
             if (ret_p != std::string::npos) {
+                del_rows = tbl->sample_rows; // only copy when RETURNING is needed
+            }
+            if (!m_impl->in_transaction) {
+                for (std::size_t row_index = 0;
+                     row_index < tbl->storage_record_ids.size(); ++row_index) {
+                    auto erased = state_storage::erase_page_row(
+                        *m_impl->shared_state, *tbl, row_index);
+                    if (!erased) return erased.error();
+                }
+            }
+            tbl->total_rows = 0;
+            tbl->row_flags.clear();
+            tbl->storage_record_ids.clear();
+            m_impl->clear_insert_templates();
+            // Phase 6: clear all indexes for this table
+            {
+                std::string tbl_low = query_engine::to_lower(tbl->name);
+                std::shared_lock<std::shared_mutex> db_lk(m_impl->shared_state->db_mutex);
+                for (auto& [iname, idx] : m_impl->shared_state->indexes) {
+                    if (idx->table_name == tbl_low) {
+                        std::unique_lock<std::shared_mutex> ilk(idx->mutex);
+                        idx->entries.clear();
+                    }
+                }
+            }
+            if (ret_p != std::string::npos) {
+                std::vector<std::vector<types::Value>>().swap(tbl->sample_rows);
                 return project_returning(sql, ret_p, *tbl, del_rows);
             }
+            auto trash = std::make_unique<std::vector<std::vector<types::Value>>>();
+            trash->swap(tbl->sample_rows);
+            std::thread([to_delete = std::move(trash)]() mutable {
+                to_delete->clear();
+            }).detach();
             return create_result(affected, false);
         } else {
             query_engine::WherePredicate pred;
             if (query_engine::parse_simple_where(sql, pred)) {
-                std::vector<std::vector<types::Value>> del_rows;
-                auto it = std::remove_if(tbl->sample_rows.begin(), tbl->sample_rows.end(), [&](const auto& r) {
-                    bool matches = query_engine::eval_predicate(pred, r, *tbl, m_impl->shared_state.get());
-                    if (matches && ret_p != std::string::npos) {
-                        del_rows.push_back(r);
+                if (pred.op == "=" && tbl->get_col_idx(pred.column) == 0 && pred.is_numeric && ret_p == std::string::npos) {
+                    std::int64_t tid = static_cast<std::int64_t>(pred.num_value);
+                    std::size_t found_idx = static_cast<std::size_t>(-1);
+                    if (tid >= 1 && static_cast<std::size_t>(tid - 1) < tbl->sample_rows.size()) {
+                        if (!tbl->sample_rows[tid - 1].empty() && query_engine::value_as_int64(tbl->sample_rows[tid - 1][0]) == tid) {
+                            found_idx = static_cast<std::size_t>(tid - 1);
+                        }
                     }
-                    return matches;
-                });
-                std::size_t removed = std::distance(it, tbl->sample_rows.end());
-                tbl->sample_rows.erase(it, tbl->sample_rows.end());
+                    if (found_idx == static_cast<std::size_t>(-1)) {
+                        for (std::size_t si = 0; si < tbl->sample_rows.size(); ++si) {
+                            if (!tbl->sample_rows[si].empty() && query_engine::value_as_int64(tbl->sample_rows[si][0]) == tid) {
+                                found_idx = si;
+                                break;
+                            }
+                        }
+                    }
+                    if (found_idx != static_cast<std::size_t>(-1)) {
+                        if (!m_impl->in_transaction) {
+                            auto erased = state_storage::erase_page_row(
+                                *m_impl->shared_state, *tbl, found_idx);
+                            if (!erased) return erased.error();
+                        }
+                        if (found_idx < tbl->row_flags.size()) {
+                            std::atomic_ref<uint8_t>(tbl->row_flags[found_idx])
+                                .fetch_or(0x02, std::memory_order_release);
+                        }
+                        tbl->sample_rows[found_idx].clear();
+                        if (tbl->total_rows > 0) tbl->total_rows--;
+                        // Phase 6: rebuild indexes (row slot cleared in-place, indices still valid)
+                        {
+                            std::string tbl_low = query_engine::to_lower(tbl->name);
+                            std::shared_lock<std::shared_mutex> db_lk(m_impl->shared_state->db_mutex);
+                            for (auto& [iname, idx] : m_impl->shared_state->indexes) {
+                                if (idx->table_name == tbl_low) { idx->rebuild(*tbl); }
+                            }
+                        }
+                        return create_simple_affected_result(1);
+                    }
+                    return create_result(0, false);
+                }
+
+                std::vector<std::vector<types::Value>> del_rows;
+                std::vector<std::vector<types::Value>> kept_rows;
+                std::vector<uint8_t> kept_flags;
+                std::vector<storage::RecordID> kept_record_ids;
+                kept_rows.reserve(tbl->sample_rows.size());
+                kept_flags.reserve(tbl->row_flags.size());
+                kept_record_ids.reserve(tbl->storage_record_ids.size());
+                std::size_t removed = 0;
+                for (std::size_t row_index = 0;
+                     row_index < tbl->sample_rows.size(); ++row_index) {
+                    const auto& row = tbl->sample_rows[row_index];
+                    const bool matches = query_engine::eval_predicate(
+                        pred, row, *tbl, m_impl->shared_state.get());
+                    if (matches && ret_p != std::string::npos) {
+                        del_rows.push_back(row);
+                    }
+                    if (matches) {
+                        if (!m_impl->in_transaction) {
+                            auto erased = state_storage::erase_page_row(
+                                *m_impl->shared_state, *tbl, row_index);
+                            if (!erased) return erased.error();
+                        }
+                        ++removed;
+                        continue;
+                    }
+                    kept_rows.push_back(row);
+                    if (row_index < tbl->row_flags.size()) {
+                        kept_flags.push_back(tbl->row_flags[row_index]);
+                    } else {
+                        kept_flags.push_back(0x01);
+                    }
+                    if (row_index < tbl->storage_record_ids.size()) {
+                        kept_record_ids.push_back(tbl->storage_record_ids[row_index]);
+                    } else {
+                        kept_record_ids.emplace_back();
+                    }
+                }
+                tbl->sample_rows = std::move(kept_rows);
+                tbl->row_flags = std::move(kept_flags);
+                tbl->storage_record_ids = std::move(kept_record_ids);
                 tbl->total_rows = (tbl->total_rows >= removed) ? (tbl->total_rows - removed) : 0;
+                // Phase 6: rebuild indexes after rows removed (indices shifted)
+                if (removed > 0) {
+                    std::string tbl_low = query_engine::to_lower(tbl->name);
+                    std::shared_lock<std::shared_mutex> db_lk(m_impl->shared_state->db_mutex);
+                    for (auto& [iname, idx] : m_impl->shared_state->indexes) {
+                        if (idx->table_name == tbl_low) { idx->rebuild(*tbl); }
+                    }
+                }
 
                 if (ret_p != std::string::npos) {
                     return project_returning(sql, ret_p, *tbl, del_rows);
@@ -1249,7 +2120,19 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
             std::size_t affected = (tbl->total_rows > 0) ? 1 : 0;
             if (tbl->total_rows >= affected) {
                 tbl->total_rows -= affected;
-                if (!tbl->sample_rows.empty()) tbl->sample_rows.pop_back();
+                if (!tbl->sample_rows.empty()) {
+                    const auto row_index = tbl->sample_rows.size() - 1;
+                    if (!m_impl->in_transaction) {
+                        auto erased = state_storage::erase_page_row(
+                            *m_impl->shared_state, *tbl, row_index);
+                        if (!erased) return erased.error();
+                    }
+                    tbl->sample_rows.pop_back();
+                    if (!tbl->row_flags.empty()) tbl->row_flags.pop_back();
+                    if (!tbl->storage_record_ids.empty()) {
+                        tbl->storage_record_ids.pop_back();
+                    }
+                }
             }
             return create_result(affected, false);
         }
@@ -1290,14 +2173,23 @@ nemo::Result<Result> Connection::execute(std::string_view sql, std::span<const t
         std::size_t affected = 0;
         std::vector<std::vector<types::Value>> updated_rows;
 
-        for (auto& row : tbl->sample_rows) {
+        for (std::size_t row_index = 0;
+             row_index < tbl->sample_rows.size(); ++row_index) {
+            auto& row = tbl->sample_rows[row_index];
             bool matches = (!has_where || query_engine::eval_predicate(pred, row, *tbl, m_impl->shared_state.get()));
             if (matches) {
+                auto updated_row = row;
                 for (const auto& [c_idx, new_val] : assignments) {
-                    if (c_idx < row.size()) {
-                        row[c_idx] = new_val;
+                    if (c_idx < updated_row.size()) {
+                        updated_row[c_idx] = new_val;
                     }
                 }
+                if (!m_impl->in_transaction) {
+                    auto stored = state_storage::update_page_row(
+                        *m_impl->shared_state, *tbl, row_index, updated_row);
+                    if (!stored) return stored.error();
+                }
+                row = std::move(updated_row);
                 affected++;
                 if (ret_p != std::string::npos) {
                     updated_rows.push_back(row);
@@ -1323,8 +2215,59 @@ nemo::Result<PreparedStatement> Connection::prepare(std::string_view sql) {
     return create_prepared_statement(std::string(sql));
 }
 
+nemo::Result<void> Connection::begin_transaction_state() {
+    if (!m_impl) {
+        return nemo::Result<void>::success();
+    }
+    if (m_impl->shared_state && m_impl->shared_state->buffer_pool) {
+        std::vector<std::shared_ptr<TableData>> tables;
+        {
+            std::shared_lock db_lock(m_impl->shared_state->db_mutex);
+            tables.reserve(m_impl->shared_state->tables.size());
+            for (const auto& [_, table] : m_impl->shared_state->tables) {
+                tables.push_back(table);
+            }
+        }
+        for (const auto& table : tables) {
+            auto refresh_result = state_storage::refresh_table_rows(
+                *m_impl->shared_state, *table);
+            if (!refresh_result) return refresh_result.error();
+        }
+    }
+    m_impl->in_transaction = true;
+    m_impl->transaction_id = m_impl->shared_state &&
+            m_impl->shared_state->wal_manager
+        ? m_impl->shared_state->alloc_txn_id()
+        : 0;
+    m_impl->transaction_last_lsn = 0;
+    // Phase 5: snapshot row counts at txn start so commit/rollback know the range
+    m_impl->pending_row_starts.clear();
+    if (m_impl->shared_state && m_impl->shared_state->wal_manager) {
+        std::shared_lock<std::shared_mutex> lk(m_impl->shared_state->db_mutex);
+        for (auto& [tname, tbl] : m_impl->shared_state->tables) {
+            std::shared_lock<std::shared_mutex> tbl_lk(tbl->mutex);
+            m_impl->pending_row_starts[tbl.get()] = tbl->sample_rows.size();
+        }
+    }
+    if (m_impl->shared_state) {
+        wal::LogRecord rec(
+            m_impl->transaction_id, wal::LogRecordType::TxnBegin,
+            wal::LSN::invalid());
+        auto append_result = m_impl->shared_state->wal_append(rec);
+        if (!append_result) {
+            m_impl->in_transaction = false;
+            m_impl->transaction_id = 0;
+            m_impl->pending_row_starts.clear();
+            return append_result.error();
+        }
+        m_impl->transaction_last_lsn = append_result.value();
+    }
+    return nemo::Result<void>::success();
+}
+
 nemo::Result<Transaction> Connection::begin() {
-    if (m_impl) m_impl->in_transaction = true;
+    auto begin_result = begin_transaction_state();
+    if (!begin_result) return begin_result.error();
     return Transaction(this);
 }
 
@@ -1334,16 +2277,95 @@ nemo::Result<Transaction> Connection::transaction() {
 
 nemo::Result<void> Connection::commit() {
     if (m_impl) {
+        // Phase 5: mark all rows inserted in this txn as committed (Read-Committed visibility)
+        if (m_impl->shared_state) {
+            std::shared_lock<std::shared_mutex> db_lk(m_impl->shared_state->db_mutex);
+            for (auto& [tbl_ptr, from_idx] : m_impl->pending_row_starts) {
+                std::unique_lock<std::shared_mutex> tbl_lk(tbl_ptr->mutex);
+                tbl_ptr->commit_rows(from_idx);
+            }
+        }
+
+        if (m_impl->shared_state) {
+            nemo::Result<void> persist_result;
+            if (m_impl->shared_state->wal_manager && m_impl->in_transaction) {
+                auto transaction_scope =
+                    m_impl->shared_state->wal_manager->transaction_scope(
+                        m_impl->transaction_id);
+                persist_result = m_impl->shared_state->persist_state();
+            } else {
+                persist_result = m_impl->shared_state->persist_state();
+            }
+            if (!persist_result) return persist_result.error();
+        }
+
+        if (m_impl->shared_state && m_impl->shared_state->wal_manager &&
+            m_impl->in_transaction) {
+            wal::LogRecord rec(
+                m_impl->transaction_id, wal::LogRecordType::TxnCommit,
+                wal::LSN(m_impl->transaction_last_lsn));
+            auto append_result = m_impl->shared_state->wal_append(rec);
+            if (!append_result) return append_result.error();
+            auto flush_result = m_impl->shared_state->wal_flush(append_result.value());
+            if (!flush_result) return flush_result.error();
+            m_impl->transaction_last_lsn = append_result.value();
+        }
+
+        m_impl->pending_row_starts.clear();
         m_impl->in_transaction = false;
         m_impl->savepoints.clear();
+        m_impl->transaction_id = 0;
+        m_impl->transaction_last_lsn = 0;
     }
     return nemo::Result<void>::success();
 }
 
+nemo::Result<void> Connection::flush() {
+    if (m_impl && m_impl->shared_state) {
+        auto wal_result = m_impl->shared_state->wal_flush_all();
+        if (!wal_result) return wal_result.error();
+        auto persist_result = m_impl->shared_state->persist_state();
+        if (!persist_result) return persist_result.error();
+    }
+    return nemo::Result<void>::success();
+}
+
+nemo::Result<void> Connection::checkpoint() {
+    return flush();
+}
+
 nemo::Result<void> Connection::rollback() {
     if (m_impl) {
+        // Phase 5: soft-delete rows inserted in this txn (mark as deleted, invisible)
+        if (m_impl->shared_state) {
+            std::shared_lock<std::shared_mutex> db_lk(m_impl->shared_state->db_mutex);
+            for (auto& [tbl_ptr, from_idx] : m_impl->pending_row_starts) {
+                std::unique_lock<std::shared_mutex> tbl_lk(tbl_ptr->mutex);
+                tbl_ptr->delete_rows(from_idx);
+                tbl_ptr->total_rows = tbl_ptr->sample_rows.size();
+            }
+        }
+        m_impl->pending_row_starts.clear();
+        nemo::Result<void> wal_result;
+        if (m_impl->shared_state && m_impl->shared_state->wal_manager &&
+            m_impl->transaction_id != 0) {
+            wal::LogRecord rec(
+                m_impl->transaction_id, wal::LogRecordType::TxnAbort,
+                wal::LSN(m_impl->transaction_last_lsn));
+            auto append_result = m_impl->shared_state->wal_append(rec);
+            if (!append_result) {
+                wal_result = append_result.error();
+            } else {
+                auto flush_result = m_impl->shared_state->wal_flush(append_result.value());
+                if (!flush_result) wal_result = flush_result.error();
+                m_impl->transaction_last_lsn = append_result.value();
+            }
+        }
         m_impl->in_transaction = false;
         m_impl->savepoints.clear();
+        m_impl->transaction_id = 0;
+        m_impl->transaction_last_lsn = 0;
+        if (!wal_result) return wal_result.error();
     }
     return nemo::Result<void>::success();
 }

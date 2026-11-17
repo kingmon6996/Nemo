@@ -91,6 +91,14 @@ bool Value::operator<(const Value& other) const {
     return m_data < other.m_data;
 }
 
+std::uint32_t Value::enum_id() const {
+    return std::get<std::pair<std::uint32_t, std::string>>(m_data).first;
+}
+
+const std::string& Value::enum_label() const {
+    return std::get<std::pair<std::uint32_t, std::string>>(m_data).second;
+}
+
 std::string Value::to_string() const {
     if (m_is_null) return "NULL";
     

@@ -19,12 +19,10 @@ Demonstrates creating database sequences, using nextval() and currval() in SQL q
 and allocating private contiguous ID ranges for high-speed multi-threaded batch ingestion.
 """
 
-import os
 import threading
 import nemo
 
 DB_NAME = "example7_sequences_demo"
-DB_FILE = f"{DB_NAME}.nm"
 
 def worker_batch_insert(db, worker_id: int, ids_per_worker: int):
     """Simulates a worker thread reserving a private ID range and inserting records."""
@@ -103,10 +101,7 @@ def main():
                 print(f"       - ID #{row[0]}: {row[1]} | Amount: ${row[2]:.2f}")
 
     # Clean up local database file
-    if os.path.exists(DB_FILE):
         try:
-            os.remove(DB_FILE)
-            print(f"\n[Cleanup] Cleaned up temporary database: {DB_FILE}")
         except OSError:
             pass
 

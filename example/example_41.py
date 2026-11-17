@@ -8,21 +8,16 @@ storage: slot directory headers, variable-length record packing upward from
 the page base, tombstone deletion slots, and fragmentation-free compaction.
 """
 
-import os
 import nemo
 
 DB_NAME = "example41_slotted_pages"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 41: SLOTTED PAGE STORAGE")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -79,10 +74,7 @@ def main():
                 print("\n[6] Slotted page physical layout verified successfully.")
 
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\n" + "=" * 70)
     print("   EXAMPLE 41 COMPLETED SUCCESSFULLY!")
     print("=" * 70)

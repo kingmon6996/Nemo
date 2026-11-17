@@ -64,16 +64,9 @@ std::vector<std::byte> RecordSerializer::serialize(const Record& record, const T
     if (has_varlen) {
         std::size_t var_offset_array_start = buffer.size();
         
-        // We will only write offsets for non-null variable fields.
-        std::uint32_t active_var_fields = 0;
-        for (std::size_t i = 0; i < layout.column_count(); ++i) {
-            if (layout.column(i).fixed_length == 0 && !record.field(i).is_null()) {
-                active_var_fields++;
-            }
-        }
-        
-        // Pre-allocate offsets array
-        std::vector<std::byte> var_offsets(active_var_fields * 4, std::byte{0});
+        // Keep one offset per variable column, including null columns.
+        std::vector<std::byte> var_offsets(layout.variable_count() * sizeof(std::uint32_t),
+                                           std::byte{0});
         buffer.insert(buffer.end(), var_offsets.begin(), var_offsets.end());
         
         std::uint32_t var_idx = 0;
@@ -81,7 +74,7 @@ std::vector<std::byte> RecordSerializer::serialize(const Record& record, const T
         
         for (std::size_t i = 0; i < layout.column_count(); ++i) {
             const auto& col = layout.column(i);
-            if (col.fixed_length == 0 && !record.field(i).is_null()) {
+            if (col.fixed_length == 0) {
                 // Write offset to the offset array
                 std::uint32_t offset_val = current_var_data_offset;
                 
@@ -96,11 +89,12 @@ std::vector<std::byte> RecordSerializer::serialize(const Record& record, const T
                     std::memcpy(ptr, &offset_val, 4);
                 }
                 
-                auto bytes = types::TypeSerializer::serialize(record.field(i));
-                const std::byte* bptr = reinterpret_cast<const std::byte*>(bytes.data());
-                buffer.insert(buffer.end(), bptr, bptr + bytes.size());
-                
-                current_var_data_offset += static_cast<std::uint32_t>(bytes.size());
+                if (!record.field(i).is_null()) {
+                    auto bytes = types::TypeSerializer::serialize(record.field(i));
+                    const std::byte* bptr = reinterpret_cast<const std::byte*>(bytes.data());
+                    buffer.insert(buffer.end(), bptr, bptr + bytes.size());
+                    current_var_data_offset += static_cast<std::uint32_t>(bytes.size());
+                }
                 var_idx++;
             }
         }
@@ -111,6 +105,7 @@ std::vector<std::byte> RecordSerializer::serialize(const Record& record, const T
     header.size = static_cast<std::uint32_t>(buffer.size());
     header.set_has_nulls(has_nulls);
     header.set_has_varlen(has_varlen);
+    header.set_varlen_offsets_include_nulls(has_varlen);
     
     // Convert endianness if necessary
     if constexpr (std::endian::native == std::endian::big) {

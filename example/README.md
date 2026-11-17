@@ -102,7 +102,13 @@ This directory contains **50 comprehensive, self-contained executable examples**
 
 ## Running the Examples
 
-Each example is a standalone executable script that creates an isolated local database, executes the scenario, prints diagnostic output, and cleans up its database upon exit:
+Each example is a standalone executable script that:
+1. Creates an isolated Nemo database in `.nemo/<db_name>/` relative to the working directory.
+2. Executes the scenario and prints diagnostic output.
+3. Automatically cleans up the `.nemo/<db_name>/` folder on exit.
+
+> [!NOTE]
+> Databases are stored in `.nemo/<name>/` — **not** as a `.nm` file. Never pass a file path or `.nm` extension to `nemo.connect()`.
 
 ```bash
 # Run any individual example
@@ -111,6 +117,6 @@ python example/example_20.py
 python example/example_40.py
 python example/example_50.py
 
-# Run all 50 examples sequentially
-python -c "import subprocess, sys; [subprocess.run([sys.executable, f'example/example_{i}.py'], check=True) for i in range(1, 51)]"
+# Run all 56 examples sequentially
+python -c "import subprocess, sys; [subprocess.run([sys.executable, f'example/example_{i}.py'], check=True) for i in range(1, 57)]"
 ```

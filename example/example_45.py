@@ -8,21 +8,16 @@ column-level cardinality distributions from `conn.analyze()` to calculate physic
 operator costs and select optimal execution plans via `conn.explain()`.
 """
 
-import os
 import nemo
 
 DB_NAME = "example45_cbo_optimizer"
-DB_FILE = f"{DB_NAME}.nm"
 
 def main():
     print("=" * 70)
     print("   NEMO DATABASE ENGINE — EXAMPLE 45: CBO OPTIMIZER & STATISTICS")
     print("=" * 70)
 
-    if os.path.exists(DB_FILE):
-        try: os.remove(DB_FILE)
-        except OSError: pass
-
+    import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     try:
         with nemo.connect(DB_NAME) as db:
             with db.connect_sync() as conn:
@@ -69,10 +64,7 @@ def main():
                     print(f"      Facility: {fac:<10} | Incidents: {count} | Avg Temp: {avg_temp:.2f} C")
 
     finally:
-        if os.path.exists(DB_FILE):
-            try: os.remove(DB_FILE)
-            except OSError: pass
-
+        import shutil; shutil.rmtree(f".nemo/{DB_NAME}", ignore_errors=True)
     print("\n" + "=" * 70)
     print("   EXAMPLE 45 COMPLETED SUCCESSFULLY!")
     print("=" * 70)
